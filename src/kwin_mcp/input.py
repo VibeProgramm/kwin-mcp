@@ -897,19 +897,32 @@ class InputBackend:
         for tid in tids:
             self._client.touch_up(tid)
 
-    def keyboard_type_unicode(self, text: str, dbus_address: str | None = None) -> bool:
+    def keyboard_type_unicode(
+        self,
+        text: str,
+        env: dict[str, str] | None = None,
+    ) -> bool:
         """Type arbitrary Unicode text using wtype or clipboard fallback.
 
         Args:
             text: Text to type (supports non-ASCII, e.g. Korean, CJK).
-            dbus_address: D-Bus address for the session (needed for wl-copy fallback).
+            env: Environment for the spawned tool. MUST contain the session's
+                WAYLAND_DISPLAY (and XDG_RUNTIME_DIR) so that wtype/wl-copy
+                connect to the isolated compositor instead of the host, plus
+                DBUS_SESSION_BUS_ADDRESS. If None, os.environ is used
+                (host session only — wtype will target the host compositor).
 
         Returns:
             True if text was typed successfully.
+
+        Note:
+            The AutomationEngine (core.py) passes its ``_session_env()`` here.
+            Previously the env was built locally without WAYLAND_DISPLAY,
+            which made wtype fail with "Wayland connection failed" in isolated
+            sessions and left the clipboard fallback unreachable (H-1).
         """
-        env = dict(__import__("os").environ)
-        if dbus_address:
-            env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
+        if env is None:
+            env = dict(__import__("os").environ)
 
         # Try wtype first
         if shutil.which("wtype"):
@@ -919,7 +932,10 @@ class InputBackend:
                 capture_output=True,
                 timeout=5,
             )
-            return result.returncode == 0
+            if result.returncode == 0:
+                return True
+            # wtype failed (e.g. missing Wayland socket) — fall through to the
+            # clipboard fallback instead of giving up.
 
         # Fallback: clipboard paste via wl-copy + Ctrl+V
         # Use Popen + DEVNULL to avoid pipe-blocking from wl-copy's forked child
