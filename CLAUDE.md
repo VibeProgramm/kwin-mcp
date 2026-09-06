@@ -21,6 +21,7 @@ uv add --dev <pkg>        # Add dev dependency
 uv run ruff check .       # Lint
 uv run ruff format .      # Format
 uv run ty check           # Type check
+uv run pytest tests/ -q   # Run unit tests
 uv run python -m kwin_mcp # Run server
 ```
 
@@ -42,13 +43,14 @@ See ROADMAP.md. Key modules:
 - `session.py`: Virtual sessions (dbus-run-session + kwin_wayland --virtual) and live session attachment (session_connect to real desktop or container)
 - `screenshot.py`: KWin ScreenShot2 D-Bus (screenshots)
 - `accessibility.py`: AT-SPI2 (widget tree)
+- `kwin_windows.py`: Compositor-side window geometry via KWin scripting (AT-SPI coordinate translation)
 - `input.py`: KWin EIS D-Bus + libei (input injection)
 
 ## Pre-work Checklist
 
 1. Read `ROADMAP.md` to understand current progress
 2. Start from the first incomplete item in the next milestone
-3. After code changes, run `uv run ruff check .` + `uv run ruff format .` + `uv run ty check`
+3. After code changes, run `uv run ruff check .` + `uv run ruff format .` + `uv run ty check` + `uv run pytest tests/ -q`
 4. Update ROADMAP.md checklist when a milestone item is completed
 5. **Verify with CLI, not MCP tools**: After modifying any kwin-mcp code, verify via the CLI (`uv run python -m kwin_mcp.cli`), NOT the MCP server tools. The MCP server process is already running with the old code loaded in memory — calling MCP tools after editing source files will NOT reflect the changes. Use the CLI to launch a session and test the modified functionality. Use `keep_screenshots=true` in `session_start` to preserve screenshot files after `session_stop` (they are deleted by default). Files in `/tmp/kwin-mcp-screenshots-*` must be cleaned up manually when this option is used.
 6. **Invoke docs-seo agent after relevant file changes**: After modifying any of the trigger files below, invoke the `@docs-seo` agent to evaluate whether documentation is stale. A no-op conclusion is acceptable if nothing needs updating.
@@ -75,7 +77,7 @@ See ROADMAP.md. Key modules:
 
 **Automation — Claude Code hook**: `.claude/settings.json` registers a `PostToolUse` hook on `Bash` that runs `.claude/hooks/docs-seo-trigger.sh` when `git commit` or `git add` is executed. The script detects whether committed files match trigger patterns, then injects context into the conversation prompting docs-seo evaluation.
 
-**Automation — CI**: `.github/workflows/docs-seo.yml` runs `scripts/check_docs_seo.py` on pull requests to validate SEO keyword consistency.
+- **Automation — CI**: `.github/workflows/docs-seo.yml` runs `scripts/check_docs_seo.py` and `scripts/sync_plugin_version.py --check` on pull requests to validate SEO keyword and plugin version consistency; `.github/workflows/ci.yml` also has a `test` job running `uv run pytest tests/ -q`.
 
 **Manual invocation**: Use `/check-docs-seo` skill or the `@docs-seo` agent directly.
 
@@ -85,7 +87,6 @@ See ROADMAP.md. Key modules:
 - `python-gobject`: GObject introspection Python bindings (installed)
 - `kwin`: KWin Wayland compositor (installed)
 - `spectacle`: Screenshot tool (installed, fallback)
-- `selenium-webdriver-at-spi`: inputsynth binary (AUR, may need installation)
 
 ## Documentation & SEO
 
@@ -100,7 +101,7 @@ When writing or editing any documentation (README.md, CHANGELOG.md, GitHub relea
 ### README.md Rules
 
 - H1 must be the project name; the line immediately after must be a bold description under 160 characters (acts as meta description for GitHub/search engines)
-- Include a badge row (PyPI version, downloads, Python version, license, CI status)
+- Include a badge row (Python version, license, CI status; no PyPI badges — this fork does not publish to PyPI)
 - Use keyword-rich headings (e.g. "Available Tools", "System Requirements", "How It Works")
 - Maintain the tool reference tables with tool name, parameters, and description columns
 - Include copy-paste installation commands (uv, pip, from source)
@@ -135,5 +136,5 @@ When writing or editing any documentation (README.md, CHANGELOG.md, GitHub relea
 
 - **About description**: must match pyproject.toml `description` or be a shorter variant with primary keywords
 - **Topics**: maintain 15-20 topics mirroring pyproject.toml keywords plus GitHub-specific tags (e.g. `hacktoberfest` when applicable)
-- **Homepage URL**: link to PyPI project page (`https://pypi.org/project/kwin-mcp/`)
+- **Homepage URL**: link to the PyPI project page (`https://pypi.org/project/kwin-mcp/`) — tracks the upstream package
 - **Social preview**: use a branded 1280x640 image with project name, tagline, and technology logos/icons

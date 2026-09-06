@@ -44,9 +44,10 @@ sudo apt install wl-clipboard wtype wayland-utils
 ### Clone and Install
 
 ```bash
-git clone https://github.com/isac322/kwin-mcp.git
+git clone https://github.com/VibeProgramm/kwin-mcp.git
 cd kwin-mcp
 uv sync
+uv run pytest tests/ -q   # run the test suite (CI runs the same on PRs)
 ```
 
 ### Documentation Consistency Check
@@ -85,9 +86,10 @@ Key style rules:
 
 ## Testing Changes
 
-After modifying kwin-mcp code, verify your changes via the interactive CLI:
+After modifying kwin-mcp code, run the regression test suite and verify your changes via the interactive CLI:
 
 ```bash
+uv run pytest tests/ -q    # regression tests (tool registry, live-mode patch)
 uv run python -m kwin_mcp.cli
 ```
 
@@ -133,6 +135,7 @@ src/kwin_mcp/
 ├── session.py         # KWin session management (isolated virtual + live desktop)
 ├── screenshot.py      # Screenshot capture via KWin ScreenShot2 D-Bus
 ├── accessibility.py   # AT-SPI2 accessibility tree inspection
+├── kwin_windows.py    # Compositor-side window geometry (AT-SPI coordinate translation)
 └── input.py           # Input injection via KWin EIS D-Bus + libei
 
 integrations/
@@ -153,13 +156,16 @@ integrations/
 scripts/
 ├── check_docs_seo.py                                           # documentation/SEO consistency checker (CI)
 └── sync_plugin_version.py                                      # syncs pyproject version + SKILL.md to integrations/
+
+tests/
+└── test_server.py                                              # regression tests for tool registration (pytest, CI `test` job)
 ```
 
 ## Pull Request Process
 
 1. Fork the repository and create a feature branch
 2. Make your changes following the code style guidelines above
-3. Run all checks: `uv run ruff check . && uv run ruff format --check . && uv run ty check`
+3. Run all checks: `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest tests/ -q`
 4. Update `CHANGELOG.md` if your change is user-facing (new tools, bug fixes, behavior changes)
 5. Update `README.md` if you add new tools or change existing tool behavior
 6. **If you bumped `pyproject.toml [project].version` or modified the MCP tool list (`src/kwin_mcp/server.py`)**: run `python3 scripts/sync_plugin_version.py` to keep `.claude-plugin/marketplace.json`, `integrations/claude-code/.claude-plugin/plugin.json`, `integrations/opencode/plugin/package.json`, and the OpenCode plugin's bundled SKILL.md in sync with the source. Verify with `python3 scripts/sync_plugin_version.py --check` (CI runs the same check).

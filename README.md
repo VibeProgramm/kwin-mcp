@@ -2,11 +2,9 @@
 
 **Model Context Protocol server for Linux desktop GUI automation on KDE Plasma 6 Wayland**
 
-[![PyPI version](https://img.shields.io/pypi/v/kwin-mcp)](https://pypi.org/project/kwin-mcp/)
-[![Downloads](https://img.shields.io/pypi/dm/kwin-mcp)](https://pypi.org/project/kwin-mcp/)
-[![Python 3.12+](https://img.shields.io/pypi/pyversions/kwin-mcp)](https://pypi.org/project/kwin-mcp/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/VibeProgramm/kwin-mcp/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/isac322/kwin-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/isac322/kwin-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/VibeProgramm/kwin-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/VibeProgramm/kwin-mcp/actions/workflows/ci.yml)
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents (Claude Code, Cursor, and other MCP clients) to launch, interact with, and observe any Wayland application in a fully isolated virtual KWin session -- without affecting the user's desktop. It also supports **live desktop automation** by connecting to an existing KWin session (real desktop or container) for collaborative workflows. With 30 MCP tools covering mouse, keyboard, touch, clipboard, accessibility tree inspection, screenshot capture, and window management, kwin-mcp provides everything needed for end-to-end GUI testing and desktop automation on Linux.
 
@@ -63,10 +61,12 @@ Automate kiosk interfaces and embedded Linux desktops running KDE Plasma or a ba
 
 ```bash
 # Using uv (recommended)
-uv tool install kwin-mcp
+uv tool install git+https://github.com/VibeProgramm/kwin-mcp
 
-# Or using pip
-pip install kwin-mcp
+# Or from a source checkout
+git clone https://github.com/VibeProgramm/kwin-mcp.git
+cd kwin-mcp
+uv tool install .
 ```
 
 **2. Configure Claude Code**
@@ -98,12 +98,12 @@ Claude Code will autonomously start an isolated session, launch the app, read th
 
 ### Recommended: install as a plugin
 
-The fastest way to wire kwin-mcp into your editor is to install one of the bundled plugins. Each plugin auto-registers the MCP server **and** ships the `kwin-desktop-automation` skill, which teaches the agent which tool to call when (session-mode selection, the observe → act → verify loop, US-QWERTY vs Unicode typing, AT-SPI2 surface-local coordinates, and other platform pitfalls).
+The fastest way to wire kwin-mcp into your editor is to install one of the bundled plugins. Each plugin auto-registers the MCP server **and** ships the `kwin-desktop-automation` skill, which teaches the agent which tool to call when (session-mode selection, the observe → act → verify loop, US-QWERTY vs Unicode typing, AT-SPI2 coordinate translation, and other platform pitfalls).
 
 **Claude Code** — install the plugin from the marketplace:
 
 ```text
-/plugin marketplace add isac322/kwin-mcp
+/plugin marketplace add VibeProgramm/kwin-mcp
 /plugin install kwin-mcp@kwin-mcp
 ```
 
@@ -396,22 +396,24 @@ sudo apt install wl-clipboard wtype wayland-utils
 
 ## Installation
 
+> **Note**: the `kwin-mcp` name on PyPI tracks the upstream project (`isac322/kwin-mcp`, v0.7.0, MCP SDK 1.x). This repository is the actively maintained fork (v0.8.0, MCP SDK 2.x); install it from git or from a source checkout. The `uvx kwin-mcp` config examples in the [Configuration](#configuration) section resolve to the PyPI package.
+
 ### Using uv (recommended)
 
 ```bash
-uv tool install kwin-mcp
+uv tool install git+https://github.com/VibeProgramm/kwin-mcp
 ```
 
 ### Using pip
 
 ```bash
-pip install kwin-mcp
+pip install git+https://github.com/VibeProgramm/kwin-mcp
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/isac322/kwin-mcp.git
+git clone https://github.com/VibeProgramm/kwin-mcp.git
 cd kwin-mcp
 uv sync
 uv run kwin-mcp
@@ -426,14 +428,14 @@ uv run kwin-mcp
 - **Clipboard requires opt-in** -- Clipboard tools (`clipboard_get`, `clipboard_set`) are disabled by default because `wl-copy` can hang in isolated sessions. Enable with `enable_clipboard=true` in `session_start`, and ensure `wl-clipboard` is installed.
 - **QMenu (native context menus) may not appear in AT-SPI2** -- Qt's AT-SPI2 bridge has incomplete support for popup menus on Wayland. Context menus may not be visible in `accessibility_tree` or `find_ui_elements`. Workaround: use `screenshot` to visually locate menu items and click by coordinates.
 - **Screen edge triggers do not work with EIS input** -- Auto-hide panels and layer-shell trigger strips rely on Wayland surface input routing, which may not respond to EIS-injected pointer events. Workaround: use `dbus_call` with KWin scripting or keyboard shortcuts instead.
-- **AT-SPI2 coordinates are surface-local, not screen-global** -- Wayland clients do not know their global screen position (by design). Coordinates returned by `find_ui_elements` and `accessibility_tree` are relative to the window's top-left corner, not the virtual screen. For single-window scenarios this is usually fine; for multi-window layouts, combine with `screenshot` for absolute positioning.
+- **AT-SPI2 coordinate translation is best-effort** -- Wayland clients report window-local coordinates (they do not know their global screen position by design). kwin-mcp translates them to true screen coordinates using each window's compositor-side geometry (queried from KWin scripting, matched by caption). If a window cannot be matched, its coordinates fall back to window-local -- cross-reference with `screenshot` to disambiguate.
 
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style guidelines, and the pull request process.
 
 ```bash
-git clone https://github.com/isac322/kwin-mcp.git
+git clone https://github.com/VibeProgramm/kwin-mcp.git
 cd kwin-mcp
 uv sync
 uv run ruff check src/

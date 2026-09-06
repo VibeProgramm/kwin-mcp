@@ -34,7 +34,7 @@ This allows Claude Code to act as a desktop automation agent on real user deskto
 Claude Code
   └── kwin-mcp (MCP server)
         ├── Environment management: dbus-run-session + kwin_wayland --virtual
-        ├── Screen observation: spectacle CLI + AT-SPI2
+        ├── Screen observation: KWin ScreenShot2 D-Bus (spectacle CLI fallback) + AT-SPI2
         └── Input injection: KWin EIS D-Bus + libei
 ```
 
@@ -142,7 +142,7 @@ Triple isolation ensures no impact on the host desktop:
 - [x] `_run_atspi()` retry logic (1 retry with 0.5s delay) for transient AT-SPI2 bus failures
 - **Goal**: Address feedback from E2E PoC testing — enable state-aware UI queries and improve AT-SPI2 reliability
 
-### M11: Live Session Support (Real Desktop / Container Attachment)
+### M11: Live Session Support (Real Desktop / Container Attachment) ✅
 - [x] `SessionType` enum (`VIRTUAL` / `LIVE`) and `LiveSession` class in `session.py`
 - [x] `session_connect` MCP tool and engine method for attaching to existing KWin sessions
 - [x] Clipboard always enabled for live sessions (no `enable_clipboard` parameter needed)
@@ -150,7 +150,7 @@ Triple isolation ensures no impact on the host desktop:
 - [x] `launch_app` supported on live sessions (subprocess with host env)
 - [x] `--default-live-session` CLI/server flag to switch default session mode
 - [x] Dynamic MCP tool descriptions based on session mode
-- [ ] ydotool fallback when EIS permission is denied on real sessions
+- [ ] ydotool fallback when EIS permission is denied on real sessions (reported in `session_connect` output when installed, but no ydotool input backend is implemented yet)
 - **Goal**: Support "share my screen" collaboration and container-based agent desktops ([#1](https://github.com/isac322/kwin-mcp/issues/1))
 
 ### M12: Pluggable CLI Backend (Auto-detect Alternatives)
@@ -159,3 +159,13 @@ Triple isolation ensures no impact on the host desktop:
 - [ ] Ensure all alternatives are functionally identical (no behavioral differences)
 - [ ] Update `_INSTALL_HINTS` to suggest multiple options
 - **Goal**: Users on non-KDE or minimal setups don't need to install KDE-specific tools if equivalent alternatives are already present
+
+### M13: Coordinate Translation + Fork Maintenance (v0.8.0) ✅
+Completed in the VibeProgramm/kwin-mcp fork after v0.7.0:
+- [x] AT-SPI2 coordinates translated to true screen coordinates via compositor-side window geometry (KWin scripting query, matched by caption, best-effort with fallback to window-local coordinates)
+- [x] Fixed Python 3.14 segfault (missing `argtypes` on variadic `ei_seat_bind_capabilities` ctypes call)
+- [x] Migration to MCP Python SDK 2.x (`FastMCP` → `MCPServer`), with `mcp>=2,<3` upper bound to prevent silent major-version drift
+- [x] Tool handlers declared `async def` (mcp 2.x runs sync handlers on worker threads, which crashed libei/D-Bus ctypes usage)
+- [x] Regression test suite (`tests/test_server.py`, pytest) + CI `test` job
+- [x] GitHub Actions refresh (`actions/checkout` v7, `astral-sh/setup-uv` v10, artifact actions v7/v8)
+- [x] Dependency refresh (Pillow, PyGObject, dbus-python floors raised)

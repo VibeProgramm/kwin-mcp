@@ -12,13 +12,13 @@ Each integration package bundles:
 - The `kwin-desktop-automation` **skill**, which loads operational guidance into the agent only when desktop-automation work is requested. The skill teaches:
   1. **Which session mode to pick** — `session_start` for virtual / isolated testing, `session_connect` for live desktop / container / kiosk.
   2. **The observe → act → verify loop**, with observation tools ordered by cost (`list_windows` < `accessibility_tree` < `find_ui_elements` < `wait_for_element` < `screenshot`).
-  3. **Pitfalls** — US-QWERTY-only `keyboard_type`, Unicode via `keyboard_type_unicode`, clipboard opt-in on virtual sessions, AT-SPI2 surface-local coordinates, QMenu invisibility, screen-edge triggers ignored by EIS.
+  3. **Pitfalls** — US-QWERTY-only `keyboard_type`, Unicode via `keyboard_type_unicode`, clipboard opt-in on virtual sessions, AT-SPI2 coordinate translation, QMenu invisibility, screen-edge triggers ignored by EIS.
   4. **Cleanup** — always call `session_stop`; `keep_screenshots=true` and `keep_home=true` leak `/tmp` directories.
 
 ## Scenario A — Claude Code only
 
 ```text
-/plugin marketplace add isac322/kwin-mcp
+/plugin marketplace add VibeProgramm/kwin-mcp
 /plugin install kwin-mcp@kwin-mcp
 ```
 
@@ -90,7 +90,7 @@ sudo pacman -S uv
 sudo dnf install uv
 ```
 
-If you prefer a global install of `kwin-mcp` itself, run `uv tool install kwin-mcp` and replace `"command": ["uvx", "kwin-mcp"]` with `"command": ["kwin-mcp"]` in the OpenCode config (or the equivalent for Claude Code's `.mcp.json`).
+If you prefer a global install of `kwin-mcp` itself, run `uv tool install git+https://github.com/VibeProgramm/kwin-mcp` and replace `"command": ["uvx", "kwin-mcp"]` with `"command": ["kwin-mcp"]` in the OpenCode config (or the equivalent for Claude Code's `.mcp.json`).
 
 ### Plugin installs but the agent ignores it
 

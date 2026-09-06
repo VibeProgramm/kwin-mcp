@@ -1,6 +1,6 @@
 # @isac322/kwin-mcp-opencode
 
-OpenCode plugin for [`kwin-mcp`](https://github.com/isac322/kwin-mcp) — the MCP server for Linux desktop GUI automation on KDE Plasma 6 Wayland.
+OpenCode plugin for [`kwin-mcp`](https://github.com/VibeProgramm/kwin-mcp) — the MCP server for Linux desktop GUI automation on KDE Plasma 6 Wayland.
 
 On every OpenCode backend startup the plugin's `config` hook:
 
@@ -35,7 +35,9 @@ sudo dnf install uv
 # see https://docs.astral.sh/uv/getting-started/installation/
 ```
 
-You also need the kwin-mcp system dependencies (`kwin_wayland`, `at-spi2-core`, `spectacle`, `python-gobject`, `dbus-python`, optionally `wl-clipboard` and `wtype`). See [the kwin-mcp README](https://github.com/isac322/kwin-mcp#installing-system-dependencies) for distro-specific commands.
+> **Note**: the plugin's `uvx kwin-mcp` launch command resolves to the `kwin-mcp` package on PyPI, which tracks the upstream project (`isac322/kwin-mcp`, v0.7.0, MCP SDK 1.x). This repository is the actively maintained fork (v0.8.0, MCP SDK 2.x); to run the fork instead, install it with `uv tool install git+https://github.com/VibeProgramm/kwin-mcp` and replace `"command": ["uvx", "kwin-mcp"]` with `"command": ["kwin-mcp"]` in your config.
+
+You also need the kwin-mcp system dependencies (`kwin_wayland`, `at-spi2-core`, `spectacle`, `python-gobject`, `dbus-python`, optionally `wl-clipboard` and `wtype`). See [the kwin-mcp README](https://github.com/VibeProgramm/kwin-mcp#installing-system-dependencies) for distro-specific commands.
 
 ## Manual fallback
 
@@ -54,15 +56,15 @@ If the plugin's `config` hook ever fails to inject the MCP server (e.g. OpenCode
 }
 ```
 
-A copy of this snippet ships at [`opencode.json.example`](https://github.com/isac322/kwin-mcp/blob/main/integrations/opencode/opencode.json.example).
+A copy of this snippet ships at [`opencode.json.example`](https://github.com/VibeProgramm/kwin-mcp/blob/main/integrations/opencode/opencode.json.example).
 
 ## What the skill teaches
 
-`kwin-desktop-automation` is a host-agnostic `SKILL.md` shipped inside this npm package. It uses bare tool names (`session_start`, `screenshot`, etc.) — OpenCode adds its own `kwin-mcp_` prefix when exposing the tools to the model, so the agent learns the actual tool symbols from OpenCode's tool list rather than from the skill body. (The same SKILL.md content is shared with the [Claude Code plugin](https://github.com/isac322/kwin-mcp/tree/main/integrations/claude-code); `npm run build` copies the source from `../../claude-code/skills/...` into this package's `skill/` directory before packaging.) The skill covers:
+`kwin-desktop-automation` is a host-agnostic `SKILL.md` shipped inside this npm package. It uses bare tool names (`session_start`, `screenshot`, etc.) — OpenCode adds its own `kwin-mcp_` prefix when exposing the tools to the model, so the agent learns the actual tool symbols from OpenCode's tool list rather than from the skill body. (The same SKILL.md content is shared with the [Claude Code plugin](https://github.com/VibeProgramm/kwin-mcp/tree/main/integrations/claude-code); `npm run build` copies the source from `../../claude-code/skills/...` into this package's `skill/` directory before packaging.) The skill covers:
 
 1. **Session mode selection** — when to call `session_start` (virtual / isolated) vs `session_connect` (live / real desktop / container / kiosk).
 2. **The observe → act → verify loop** — observation tools ordered by cost (`list_windows` < `accessibility_tree` < `find_ui_elements` < `wait_for_element` < `screenshot`).
-3. **Pitfalls** — `keyboard_type` is US-QWERTY only (use `keyboard_type_unicode` for CJK), clipboard is opt-in on virtual sessions, AT-SPI2 coordinates are surface-local, QMenu can be invisible to AT-SPI2, screen-edge triggers ignore EIS pointer events, container live sessions need Wayland/D-Bus mounts.
+3. **Pitfalls** — `keyboard_type` is US-QWERTY only (use `keyboard_type_unicode` for CJK), clipboard is opt-in on virtual sessions, AT-SPI2 coordinates are translated to screen coordinates (best-effort window matching), QMenu can be invisible to AT-SPI2, screen-edge triggers ignore EIS pointer events, container live sessions need Wayland/D-Bus mounts.
 4. **Cleanup** — always `session_stop`; `keep_screenshots=true` and `keep_home=true` leak `/tmp` directories.
 
 ## Customising the skill
@@ -97,4 +99,4 @@ The published npm tarball ships only `dist/`, `skill/`, `README.md`, and `LICENS
 
 ## License
 
-MIT — see [LICENSE](https://github.com/isac322/kwin-mcp/blob/main/LICENSE).
+MIT — see [LICENSE](https://github.com/VibeProgramm/kwin-mcp/blob/main/LICENSE).
