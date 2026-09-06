@@ -58,7 +58,7 @@ jobs:
           path: dist/
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'isac322/kwin-mcp'
     needs: [lint, type-check, test, build]
     runs-on: ubuntu-latest
     environment: pypi
