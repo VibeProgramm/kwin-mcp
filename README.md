@@ -2,6 +2,8 @@
 
 **Model Context Protocol server for Linux desktop GUI automation on KDE Plasma 6 Wayland**
 
+> **Actively maintained fork** of [isac322/kwin-mcp](https://github.com/isac322/kwin-mcp). This fork ships the fixes users were waiting for: MCP Python SDK 2.x support, text input in virtual sessions (host keymap isolation), reliable window focus, bounded startup waits, silent input-drop fix, honest error contracts — see the [changelog](CHANGELOG.md) and [releases](https://github.com/VibeProgramm/kwin-mcp/releases). Install: `uv tool install git+https://github.com/VibeProgramm/kwin-mcp`
+
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/VibeProgramm/kwin-mcp/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/VibeProgramm/kwin-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/VibeProgramm/kwin-mcp/actions/workflows/ci.yml)
