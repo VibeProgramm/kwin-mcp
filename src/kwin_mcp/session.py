@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import contextlib
 import os
+import queue
 import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,6 +40,27 @@ class SessionConfig:
     isolate_home: bool = False
     keep_home: bool = False
     extra_env: dict[str, str] = field(default_factory=dict)
+
+
+def _write_deterministic_session_config(config_dir: Path) -> None:
+    """Pre-seed an isolated config dir with settings that make sessions deterministic.
+
+    KWin builds its XKB keymap from ``$XDG_CONFIG_HOME/kxkbrc`` and falls back
+    to the environment (XKB_DEFAULT_LAYOUT), which on hosts configured with a
+    non-US primary layout (e.g. ``ru,us``) makes evdev keycodes typed by the
+    EIS keyboard produce the wrong characters (``hello`` → ``руддщ``).
+    Removing kxkbrc from the isolated config dir leaves the default US layout.
+
+    The same file silences the kwallet popup that steals compositor focus at
+    session start (ksecretd/kwalletd), which otherwise breaks focus-dependent
+    flows such as focus_window + ctrl+q verification.
+
+    Only writes files that do not exist yet so explicit user pre-seeding wins.
+    """
+    config_dir.mkdir(parents=True, exist_ok=True)
+    kwalletrc = config_dir / "kwalletrc"
+    if not kwalletrc.exists():
+        kwalletrc.write_text("[Wallet]\nEnabled=false\nFirst Use=false\nLaunch Manager=false\n")
 
 
 @dataclass
@@ -80,6 +103,7 @@ class Session:
         self._app_counter: int = 0
         self._config: SessionConfig | None = None
         self._home_dir: Path | None = None
+        self._session_config_dir: Path | None = None
 
     @property
     def is_running(self) -> bool:
@@ -141,6 +165,18 @@ class Session:
             path = Path(runtime_dir) / f"{self._socket_name}{suffix}"
             path.unlink(missing_ok=True)
 
+        # Deterministic per-session config dir: without an isolated
+        # XDG_CONFIG_HOME, KWin inherits the host's kxkbrc and the virtual
+        # session runs with the host's XKB layout list (e.g. ru,us — the
+        # evdev keycodes then type Cyrillic, A-1 root cause), and the
+        # kwallet popup steals focus at session start (A-2 interference).
+        self._session_config_dir = Path(tempfile.mkdtemp(prefix="kwin-mcp-config-"))
+        _write_deterministic_session_config(self._session_config_dir)
+        # Deliberately NOT isolating XDG_DATA_HOME / XDG_CACHE_HOME: qtbase
+        # crash-logs a fatal qFatal when a nonexistent standard data dir is
+        # set (reproduced on qt6-base 6.10), and existing dirs already
+        # contain everything kwin/konsole need to start.
+
         # Build the wrapper script that runs inside dbus-run-session
         wrapper_script = self._build_wrapper_script(config)
 
@@ -154,34 +190,33 @@ class Session:
         )
 
         # Read startup output from the wrapper script.
-        # Expected lines: DBUS_SESSION_BUS_ADDRESS=..., READY
+        # Expected lines: DBUS_SESSION_BUS_ADDRESS=..., READY, NOSOCKET
         # Any other lines (e.g. from D-Bus activation) are ignored.
-        dbus_address = ""
-        got_ready = False
-        if self._process.stdout:
-            while True:
-                line = self._process.stdout.readline().decode().strip()
-                if not line and self._process.poll() is not None:
-                    break
-                if line.startswith("DBUS_SESSION_BUS_ADDRESS="):
-                    dbus_address = line.split("=", 1)[1]
-                elif line == "READY":
-                    got_ready = True
-                    break
+        dbus_address, got_ready = self._read_startup_lines(self._process, timeout=25.0)
 
         # Wait for kwin to be ready (socket file appears)
         socket_path = Path(runtime_dir) / self._socket_name
-        if not self._wait_for_socket(socket_path, timeout=10.0):
+        socket_ready = self._wait_for_socket(socket_path, timeout=10.0)
+        if not socket_ready or not got_ready:
+            # stderr.read() blocks until EOF, so terminate the session first;
+            # stop() must come after, since it clears self._process (the old
+            # code read stderr after stop() and always reported an empty one).
+            self._signal_process_group(signal.SIGTERM)
+            stderr_bytes = b""
+            if self._process is not None:
+                try:
+                    _, stderr_bytes = self._process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._signal_process_group(signal.SIGKILL)
+                    _, stderr_bytes = self._process.communicate(timeout=5)
+            stderr = stderr_bytes.decode(errors="replace")
             self.stop()
-            stderr = ""
-            if self._process and self._process.stderr:
-                stderr = self._process.stderr.read().decode(errors="replace")
-            msg = f"KWin failed to start. stderr: {stderr}"
-            raise RuntimeError(msg)
-
-        if not got_ready:
-            self.stop()
-            msg = "Session setup failed: did not receive READY signal"
+            reason = (
+                "KWin failed to start"
+                if not socket_ready
+                else "Session setup failed: did not receive READY signal"
+            )
+            msg = f"{reason}. stderr: {stderr}"
             raise RuntimeError(msg)
 
         if self._home_dir is not None:
@@ -207,7 +242,10 @@ class Session:
             msg = "Session is not running"
             raise RuntimeError(msg)
 
-        env = {
+        # NOTE: the explicit annotation matters: without it, ty's overload
+        # resolution rejects the Popen call below once DISPLAY is popped
+        # (env's type collapses to dict[str, str | None] in its inference).
+        env: dict[str, str] = {
             **os.environ,
             "WAYLAND_DISPLAY": self._socket_name,
             "QT_QPA_PLATFORM": "wayland",
@@ -219,6 +257,9 @@ class Session:
             env.update(extra_env)
         if self._info.dbus_address:
             env["DBUS_SESSION_BUS_ADDRESS"] = self._info.dbus_address
+        # Never leak the host DISPLAY into the isolated session: X11 apps
+        # would silently open on the user's real desktop (upstream #50).
+        env.pop("DISPLAY", None)
 
         # Create log file for stdout/stderr capture
         app_name = Path(command[0]).stem if command else "unknown"
@@ -280,21 +321,13 @@ class Session:
             return
 
         # Send SIGTERM to the entire process group (all children)
-        try:
-            pgid = os.getpgid(self._process.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+        self._signal_process_group(signal.SIGTERM)
 
         try:
             self._process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             # Force kill the entire process group
-            try:
-                pgid = os.getpgid(self._process.pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            self._signal_process_group(signal.SIGKILL)
             with contextlib.suppress(ProcessLookupError):
                 self._process.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -323,6 +356,11 @@ class Session:
         for suffix in ("", ".lock"):
             path = Path(runtime_dir) / f"{self._socket_name}{suffix}"
             path.unlink(missing_ok=True)
+
+        # Remove the per-session config dir
+        if self._session_config_dir is not None:
+            shutil.rmtree(self._session_config_dir, ignore_errors=True)
+            self._session_config_dir = None
 
         self._process = None
         self._info = None
@@ -354,12 +392,11 @@ sleep 0.2
 # only after KWin creates it.
 dbus-update-activation-environment WAYLAND_DISPLAY={self._socket_name} QT_QPA_PLATFORM=wayland
 
-# Start KWin WITHOUT WAYLAND_DISPLAY to prevent nesting attempt.
-# KWin with --virtual creates its own compositor, it must not try
-# to connect to another compositor as a client.
+# Start KWin WITHOUT WAYLAND_DISPLAY and without DISPLAY to prevent
+# nesting attempts on the host compositor / host X server.
 # Explicitly pass KWIN_ permission env vars to ensure they reach the
 # KWin process (environment inheritance through dbus-run-session can be unreliable).
-env -u WAYLAND_DISPLAY -u QT_QPA_PLATFORM \
+env -u WAYLAND_DISPLAY -u DISPLAY -u QT_QPA_PLATFORM \
     KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
     KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 \
     kwin_wayland --virtual --no-lockscreen \
@@ -367,8 +404,21 @@ env -u WAYLAND_DISPLAY -u QT_QPA_PLATFORM \
     --socket {self._socket_name} &
 KWIN_PID=$!
 
-# Wait for KWin socket to appear
-while [ ! -e "$XDG_RUNTIME_DIR/{self._socket_name}" ]; do sleep 0.1; done
+# Wait for the KWin socket to appear, but never block forever: give up after
+# 150 x 0.1s = 15s (bounded, upstream #50) so a dead KWin surfaces as
+# NOSOCKET + exit 1 instead of hanging on the READY handshake.
+SOCKET_OK=0
+for i in $(seq 1 150); do
+    if [ -e "$XDG_RUNTIME_DIR/{self._socket_name}" ]; then
+        SOCKET_OK=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$SOCKET_OK" != "1" ]; then
+    echo "NOSOCKET"
+    exit 1
+fi
 sleep 0.3
 
 # Signal parent that setup is complete
@@ -399,6 +449,23 @@ wait $KWIN_PID
             # Safe in isolated virtual sessions where there is no user desktop to protect.
             "KWIN_WAYLAND_NO_PERMISSION_CHECKS": "1",
         }
+        # Per-session deterministic config dir (US keymap via absent kxkbrc,
+        # kwallet popup disabled). Set after os.environ so it always wins.
+        if self._session_config_dir is not None:
+            env["XDG_CONFIG_HOME"] = str(self._session_config_dir)
+            # Strip host XKB defaults: on hosts with a non-US primary layout
+            # (e.g. ru,us via locale1) KWin compiles that keymap even with an
+            # empty kxkbrc, and evdev keycodes from the EIS keyboard then
+            # produce the host layout's characters instead of ASCII (A-1).
+            # An empty XKB_DEFAULT_LAYOUT resets libxkbcommon to plain "us".
+            for var in (
+                "XKB_DEFAULT_LAYOUT",
+                "XKB_DEFAULT_VARIANT",
+                "XKB_DEFAULT_OPTIONS",
+                "XKB_DEFAULT_RULES",
+                "XKB_DEFAULT_MODEL",
+            ):
+                env.pop(var, None)
         # Remove host display references to avoid kwin connecting to host
         env.pop("WAYLAND_DISPLAY", None)
         env.pop("DISPLAY", None)
@@ -418,6 +485,67 @@ wait $KWIN_PID
                 return False
             time.sleep(0.2)
         return False
+
+    def _signal_process_group(self, sig: signal.Signals) -> None:
+        """Send a signal to the session's whole process group, ignoring races."""
+        if self._process is None:
+            return
+        try:
+            pgid = os.getpgid(self._process.pid)
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    @staticmethod
+    def _read_startup_lines(
+        process: subprocess.Popen[bytes],
+        timeout: float,
+    ) -> tuple[str, bool]:
+        """Read wrapper startup lines with an overall deadline.
+
+        Returns ``(dbus_address, got_ready)``. Never blocks longer than
+        ``timeout`` seconds: a wrapper that never prints ``READY`` (dead
+        KWin, missing binaries) must surface as an error instead of hanging
+        the caller forever. Also recognizes the wrapper's ``NOSOCKET``
+        marker, which ends the read without READY. Adapted from upstream
+        isac322/kwin-mcp#50.
+        """
+        lines: queue.Queue[bytes | None] = queue.Queue()
+
+        def reader() -> None:
+            try:
+                if process.stdout is not None:
+                    for line in process.stdout:
+                        lines.put(line)
+            except Exception:  # drain thread must never raise
+                pass
+            finally:
+                lines.put(None)
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+
+        dbus_address = ""
+        got_ready = False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                line = lines.get(timeout=0.2)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            if line is None:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if text.startswith("DBUS_SESSION_BUS_ADDRESS="):
+                dbus_address = text.split("=", 1)[1]
+            elif text == "READY":
+                got_ready = True
+                break
+            elif text == "NOSOCKET":
+                break
+        return dbus_address, got_ready
 
     def __enter__(self) -> Session:
         return self

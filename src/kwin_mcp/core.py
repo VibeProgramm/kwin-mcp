@@ -16,6 +16,10 @@ import tempfile
 import time
 from pathlib import Path
 
+import dbus
+
+from kwin_mcp import kwin_windows
+from kwin_mcp.errors import ToolError, tool_error
 from kwin_mcp.input import InputBackend, MouseButton
 from kwin_mcp.screenshot import capture_frame_burst, capture_screenshot_to_file
 from kwin_mcp.session import LiveSession, Session, SessionConfig
@@ -48,6 +52,35 @@ _INSTALL_HINTS: dict[str, str] = {
 }
 
 
+def clip_to_screen(x: int, y: int, screen_size: tuple[int, int] | None) -> tuple[int, int, bool]:
+    """Clip coordinates to the known screen bounds.
+
+    Args:
+        x, y: Requested coordinates.
+        screen_size: Known (width, height) of the virtual screen, or None when
+            the size is unknown (live sessions): only the lower bound (>= 0)
+            is enforced and no upper-bound clipping happens.
+
+    Returns:
+        (clipped_x, clipped_y, clipped) where clipped is True when either
+        coordinate was adjusted.
+    """
+    cx = max(0, x)
+    cy = max(0, y)
+    if screen_size is not None:
+        cx = min(cx, screen_size[0] - 1)
+        cy = min(cy, screen_size[1] - 1)
+    return cx, cy, (cx != x or cy != y)
+
+
+def _parse_mouse_button(button: str) -> MouseButton:
+    """Resolve a button name to MouseButton; invalid names are a ToolError."""
+    try:
+        return MouseButton(button)
+    except ValueError:
+        tool_error(f"Invalid button {button!r}: expected 'left', 'right', or 'middle'")
+
+
 class AutomationEngine:
     """Core automation engine encapsulating all tool logic.
 
@@ -61,19 +94,22 @@ class AutomationEngine:
         self._clipboard_enabled: bool = False
         self._wl_copy_proc: subprocess.Popen[bytes] | None = None
         self._keep_screenshots: bool = False
+        self._screen_size: tuple[int, int] | None = None
 
     # ── Private helpers ───────────────────────────────────────────────────
 
     def _get_session(self) -> Session | LiveSession:
         if self._session is None or not self._session.is_running:
-            msg = "No active session. Call session_start or session_connect first."
-            raise RuntimeError(msg)
+            # Anticipated failure → ToolError so the client sees the message
+            # (isError=True) instead of a swallowed crash (H-3/H-4).
+            tool_error("No active session. Call session_start or session_connect first.")
+            raise AssertionError  # unreachable, satisfies type checkers
         return self._session
 
     def _get_input(self) -> InputBackend:
         if self._input is None:
-            msg = "No input backend. Call session_start or session_connect first."
-            raise RuntimeError(msg)
+            tool_error("No input backend. Call session_start or session_connect first.")
+            raise AssertionError  # unreachable, satisfies type checkers
         return self._input
 
     def _session_env(self) -> dict[str, str]:
@@ -136,7 +172,7 @@ class AutomationEngine:
                 continue
 
         msg = f"{last_error}. Retried once but still failed — the AT-SPI2 bus may be unstable."
-        raise RuntimeError(msg)
+        raise ToolError(msg)
 
     def _with_frame_capture(
         self,
@@ -180,9 +216,10 @@ class AutomationEngine:
     ) -> str:
         """Start an isolated KWin Wayland session, optionally launching an app."""
         if self._session is not None and self._session.is_running:
-            return "Session already running. Call session_stop first."
+            tool_error("Session already running. Call session_stop first.")
 
         self._clipboard_enabled = enable_clipboard
+        self._screen_size = (screen_width, screen_height)
 
         self._session = Session()
         config = SessionConfig(
@@ -225,18 +262,18 @@ class AutomationEngine:
     ) -> str:
         """Connect to an existing KWin session (e.g. the real desktop)."""
         if self._session is not None and self._session.is_running:
-            return "Session already running. Call session_stop first."
+            tool_error("Session already running. Call session_stop first.")
 
         dbus_addr = dbus_address or os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
         wayland_disp = wayland_display or os.environ.get("WAYLAND_DISPLAY", "")
 
         if not dbus_addr:
-            return (
+            tool_error(
                 "No D-Bus address available. Provide dbus_address parameter "
                 "or ensure $DBUS_SESSION_BUS_ADDRESS is set."
             )
         if not wayland_disp:
-            return (
+            tool_error(
                 "No Wayland display available. Provide wayland_display parameter "
                 "or ensure $WAYLAND_DISPLAY is set."
             )
@@ -249,7 +286,7 @@ class AutomationEngine:
             bus = dbus.bus.BusConnection(dbus_addr)
             bus.get_object("org.kde.KWin", "/org/kde/KWin")
         except dbus_module.DBusException as exc:
-            return f"Cannot reach KWin on D-Bus ({dbus_addr}): {exc}"
+            tool_error(f"Cannot reach KWin on D-Bus ({dbus_addr}): {exc}")
 
         screenshot_dir = Path(tempfile.mkdtemp(prefix="kwin-mcp-screenshots-"))
 
@@ -257,6 +294,7 @@ class AutomationEngine:
         session._keep_screenshots = keep_screenshots
         self._session = session
         self._keep_screenshots = keep_screenshots
+        self._screen_size = None  # live sessions: unknown size, lower bound only
 
         # Clipboard is always available on live sessions
         self._clipboard_enabled = True
@@ -306,6 +344,7 @@ class AutomationEngine:
         self._session = None
         self._input = None
         self._keep_screenshots = False
+        self._screen_size = None
 
         return "Disconnected from live session." if is_live else "Session stopped."
 
@@ -377,11 +416,14 @@ class AutomationEngine:
     ) -> str:
         """Click at coordinates in the isolated session."""
         inp = self._get_input()
-        btn = MouseButton(button)
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
+        btn = _parse_mouse_button(button)
         click_count = 3 if triple else (2 if double else 1)
         inp.mouse_click(x, y, btn, click_count=click_count, modifiers=modifiers, hold_ms=hold_ms)
 
         desc = f"Clicked {button} at ({x}, {y})"
+        if clipped:
+            desc += " (clipped to screen bounds)"
         if triple:
             desc += " (triple)"
         elif double:
@@ -401,8 +443,11 @@ class AutomationEngine:
     ) -> str:
         """Move the mouse cursor to coordinates without clicking."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         inp.mouse_move(x, y)
         result = f"Mouse moved to ({x}, {y})"
+        if clipped:
+            result += " (clipped to screen bounds)"
         return self._with_frame_capture(result, screenshot_after_ms)
 
     def mouse_scroll(
@@ -416,10 +461,13 @@ class AutomationEngine:
     ) -> str:
         """Scroll at coordinates in the isolated session."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         inp.mouse_scroll(x, y, delta, horizontal=horizontal, discrete=discrete, steps=steps)
         direction = "horizontal" if horizontal else "vertical"
         mode = "discrete" if discrete else "smooth"
         desc = f"Scrolled {direction} ({mode}) by {delta} at ({x}, {y})"
+        if clipped:
+            desc += " (clipped to screen bounds)"
         if steps > 1:
             desc += f" in {steps} steps"
         return desc
@@ -437,7 +485,7 @@ class AutomationEngine:
     ) -> str:
         """Drag from one point to another in the isolated session."""
         inp = self._get_input()
-        btn = MouseButton(button)
+        btn = _parse_mouse_button(button)
         wp: list[tuple[int, int, int]] | None = None
         if waypoints:
             wp = [(w[0], w[1], w[2]) for w in waypoints]
@@ -458,7 +506,7 @@ class AutomationEngine:
     ) -> str:
         """Press a mouse button at coordinates without releasing."""
         inp = self._get_input()
-        inp.mouse_button_down(x, y, MouseButton(button))
+        inp.mouse_button_down(x, y, _parse_mouse_button(button))
         return f"Button {button} pressed at ({x}, {y})"
 
     def mouse_button_up(
@@ -469,7 +517,7 @@ class AutomationEngine:
     ) -> str:
         """Release a mouse button at coordinates."""
         inp = self._get_input()
-        inp.mouse_button_up(x, y, MouseButton(button))
+        inp.mouse_button_up(x, y, _parse_mouse_button(button))
         return f"Button {button} released at ({x}, {y})"
 
     # ── Keyboard tools ────────────────────────────────────────────────────
@@ -492,16 +540,18 @@ class AutomationEngine:
     ) -> str:
         """Type arbitrary Unicode text including non-ASCII characters."""
         if not shutil.which("wtype") and not shutil.which("wl-copy"):
-            return (
+            tool_error(
                 "Neither wtype nor wl-copy found. Install at least one: "
                 "wtype (e.g. 'sudo pacman -S wtype') or "
                 "wl-clipboard (e.g. 'sudo pacman -S wl-clipboard')."
             )
         inp = self._get_input()
-        session = self._get_session()
-        dbus_addr = session.info.dbus_address if session.info else None
-        ok = inp.keyboard_type_unicode(text, dbus_address=dbus_addr)
-        result = f"Typed unicode: {text!r}" if ok else f"Failed to type unicode: {text!r}"
+        # _session_env() carries WAYLAND_DISPLAY + XDG_RUNTIME_DIR so wtype and
+        # wl-copy connect to the isolated compositor, not the host (H-1 fix).
+        ok = inp.keyboard_type_unicode(text, env=self._session_env())
+        if not ok:
+            tool_error(f"Failed to type unicode text {text!r} (wtype and clipboard both failed)")
+        result = f"Typed unicode: {text!r}"
         return self._with_frame_capture(result, screenshot_after_ms)
 
     def keyboard_key(
@@ -538,8 +588,11 @@ class AutomationEngine:
     ) -> str:
         """Tap at coordinates using touch input."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         inp.touch_tap(x, y, hold_ms=hold_ms)
         desc = f"Touch tap at ({x}, {y})"
+        if clipped:
+            desc += " (clipped to screen bounds)"
         if hold_ms > 0:
             desc += f" held {hold_ms}ms"
         return self._with_frame_capture(desc, screenshot_after_ms)
@@ -555,8 +608,12 @@ class AutomationEngine:
     ) -> str:
         """Swipe from one point to another using single-finger touch input."""
         inp = self._get_input()
+        from_x, from_y, clipped = clip_to_screen(from_x, from_y, self._screen_size)
+        to_x, to_y, clipped2 = clip_to_screen(to_x, to_y, self._screen_size)
         inp.touch_swipe(from_x, from_y, to_x, to_y, duration_ms=duration_ms)
         desc = f"Touch swipe from ({from_x}, {from_y}) to ({to_x}, {to_y}) in {duration_ms}ms"
+        if clipped or clipped2:
+            desc += " (clipped to screen bounds)"
         return self._with_frame_capture(desc, screenshot_after_ms)
 
     def touch_pinch(
@@ -599,7 +656,7 @@ class AutomationEngine:
     def clipboard_get(self) -> str:
         """Read the current clipboard content in the isolated session."""
         if not self._clipboard_enabled:
-            return (
+            tool_error(
                 "Clipboard not enabled. Pass enable_clipboard=True to session_start, "
                 "or use session_connect (clipboard is always enabled for live sessions)."
             )
@@ -613,15 +670,15 @@ class AutomationEngine:
                 timeout=5,
             )
         except FileNotFoundError:
-            return _INSTALL_HINTS["wl-paste"]
+            tool_error(_INSTALL_HINTS["wl-paste"])
         if result.returncode != 0:
-            return f"Failed to read clipboard: {result.stderr.decode(errors='replace')}"
+            tool_error(f"Failed to read clipboard: {result.stderr.decode(errors='replace')}")
         return result.stdout.decode(errors="replace")
 
     def clipboard_set(self, text: str) -> str:
         """Set the clipboard content in the isolated session."""
         if not self._clipboard_enabled:
-            return (
+            tool_error(
                 "Clipboard not enabled. Pass enable_clipboard=True to session_start, "
                 "or use session_connect (clipboard is always enabled for live sessions)."
             )
@@ -645,7 +702,7 @@ class AutomationEngine:
                 stderr=subprocess.DEVNULL,
             )
         except FileNotFoundError:
-            return _INSTALL_HINTS["wl-copy"]
+            tool_error(_INSTALL_HINTS["wl-copy"])
         time.sleep(0.1)  # Wait for fork to complete
         return f"Clipboard set: {text!r}"
 
@@ -659,7 +716,14 @@ class AutomationEngine:
         poll_interval_ms: int = 200,
         expected_states: list[str] | None = None,
     ) -> str:
-        """Wait for a UI element to appear in the accessibility tree."""
+        """Wait for a UI element to appear in the accessibility tree.
+
+        Error contract (H-3/H-4): a timeout is NOT a crash — it is a
+        legitimate negative result and is returned as a normal response
+        (isError=False) whose text starts with the canonical "TIMEOUT after
+        Nms" marker so agents can branch on it. Hard failures (no session,
+        AT-SPI bus down) raise ToolError instead.
+        """
         self._get_session()
         resp = self._run_atspi(
             "wait",
@@ -670,7 +734,9 @@ class AutomationEngine:
             states=expected_states,
         )
         if not resp["ok"]:
-            return resp["error"]
+            # The AT-SPI worker raises TimeoutError for a failed wait: that is
+            # the negative-result path, normalised to the TIMEOUT contract.
+            return resp["error"].replace("Timeout after", "TIMEOUT after", 1)
 
         elements = resp["result"]
 
@@ -702,15 +768,46 @@ class AutomationEngine:
 
     def list_windows(self) -> str:
         """List accessible application windows in the isolated session."""
+        session = self._get_session()
+        info = session.info
+        # Prefer the compositor-side enumeration (sees every window KWin
+        # knows, including apps without an accessibility tree — H-2); fall
+        # back to AT-SPI when scripting is unavailable.
+        if info and info.dbus_address:
+            try:
+                return kwin_windows.list_windows_by_script(info.dbus_address)
+            except (RuntimeError, dbus.DBusException):
+                pass
         self._get_session()
         resp = self._run_atspi("list_windows")
         return resp["result"]
 
     def focus_window(self, app_name: str) -> str:
-        """Attempt to focus a window by application name."""
-        self._get_session()
+        """Focus a window by application name.
+
+        Activation goes through the KWin scripting API
+        (workspace.activeWindow = w) because AT-SPI grabFocus() does not move
+        compositor-level focus on Wayland (A-2). Falls back to the AT-SPI
+        path when scripting is unavailable.
+        """
+        session = self._get_session()
+        info = session.info
+        if info and info.dbus_address:
+            try:
+                return kwin_windows.activate_window_by_name(info.dbus_address, app_name)
+            except (RuntimeError, dbus.DBusException) as exc:
+                last_error = str(exc)
+        else:
+            last_error = "session has no D-Bus address"
         resp = self._run_atspi("focus_window", app_name=app_name)
-        return resp["result"]
+        result = resp["result"]
+        if "Focused" in result:
+            note = (
+                " (AT-SPI fallback: KWin scripting failed"
+                f" — {last_error}; focus may not have moved)"
+            )
+            return result + note
+        return result
 
     # ── D-Bus tools ───────────────────────────────────────────────────────
 
@@ -743,15 +840,25 @@ class AutomationEngine:
                 timeout=10,
             )
         except FileNotFoundError:
-            return _INSTALL_HINTS["dbus-send"]
+            # Anticipated failure → ToolError so the client sees the message
+            # (isError=True) instead of a success-payload string (N2).
+            tool_error(_INSTALL_HINTS["dbus-send"])
         if result.returncode != 0:
-            return f"D-Bus call failed: {result.stderr.decode(errors='replace')}"
+            # Anticipated failure (ServiceUnknown, UnknownMethod, ...) →
+            # ToolError (isError=True), matching the read_app_log contract
+            # (N2: these used to be returned as success strings).
+            tool_error(f"D-Bus call failed: {result.stderr.decode(errors='replace')}")
         return result.stdout.decode(errors="replace")
 
     def read_app_log(self, pid: int, last_n_lines: int = 50) -> str:
         """Read stdout/stderr output of a launched app."""
         session = self._get_session()
-        return session.read_app_log(pid, last_n_lines=last_n_lines)
+        try:
+            return session.read_app_log(pid, last_n_lines=last_n_lines)
+        except ValueError as exc:
+            # Unknown PID is an anticipated failure → ToolError with the
+            # available-PIDs detail (H-3: no longer swallowed).
+            tool_error(str(exc))
 
     def wayland_info(self, filter_protocol: str = "") -> str:
         """List Wayland protocols available in the isolated session."""
