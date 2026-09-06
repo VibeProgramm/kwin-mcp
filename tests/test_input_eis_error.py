@@ -46,7 +46,9 @@ def test_setup_translates_dbus_exception_to_runtime_error() -> None:
     assert isinstance(caught.value.__cause__, dbus.DBusException)
 
 
-def test_setup_translates_connect_failure_from_interface_proxy(monkeypatch) -> None:
+def test_setup_translates_connect_failure_from_interface_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A DBusException surfacing later (Interface/connectToEIS stage) is also
     translated: the whole dbus block is covered, not just get_object."""
 
@@ -59,7 +61,6 @@ def test_setup_translates_connect_failure_from_interface_proxy(monkeypatch) -> N
             raise dbus.DBusException("org.kde.KWin.EIS.RemoteDesktop: not supported")
 
     monkeypatch.setattr(input_module.dbus, "Interface", _ThrowingIface)
-    client = _client_with_bus(object())
 
     class _OkBus:
         def get_object(self, *args: Any, **kwargs: Any) -> object:

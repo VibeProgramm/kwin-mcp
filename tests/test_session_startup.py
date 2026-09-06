@@ -114,17 +114,23 @@ def test_at_spi_launcher_falls_back_to_which(monkeypatch) -> None:
     assert session_module._at_spi_bus_launcher() == "/usr/local/bin/at-spi-bus-launcher"
 
     monkeypatch.setattr(session_module.shutil, "which", lambda name: None)
-    assert session_module._at_spi_bus_launcher() == "/nonexistent/a"
+    assert session_module._at_spi_bus_launcher() == "/usr/lib/at-spi-bus-launcher"
 
 
 def test_wrapper_script_contains_resolved_launcher(monkeypatch) -> None:
-    """The wrapper embeds the resolved launcher path, not a hardcoded one."""
+    """The wrapper embeds the resolved launcher path, not a hardcoded one, and
+    shell-quotes it so paths with special characters stay one argument."""
     monkeypatch.setattr(session_module, "_at_spi_bus_launcher", lambda: "/resolved/launcher")
     session = Session()
     session._socket_name = "wayland-mcp-test"
     script = session._build_wrapper_script(SessionConfig())
+    # shlex.quote leaves a plain path untouched (no spurious quotes).
     assert "/resolved/launcher --launch-immediately" in script
     assert "/usr/lib/at-spi-bus-launcher" not in script
+
+    monkeypatch.setattr(session_module, "_at_spi_bus_launcher", lambda: "/opt/my tools/launcher")
+    quoted = session._build_wrapper_script(SessionConfig())
+    assert "'/opt/my tools/launcher' --launch-immediately" in quoted
 
 
 def test_launch_app_strips_host_display(monkeypatch, tmp_path) -> None:
