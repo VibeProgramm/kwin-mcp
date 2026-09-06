@@ -16,6 +16,9 @@ import tempfile
 import time
 from pathlib import Path
 
+import dbus
+
+from kwin_mcp import kwin_windows
 from kwin_mcp.input import InputBackend, MouseButton
 from kwin_mcp.screenshot import capture_frame_burst, capture_screenshot_to_file
 from kwin_mcp.session import LiveSession, Session, SessionConfig
@@ -702,15 +705,46 @@ class AutomationEngine:
 
     def list_windows(self) -> str:
         """List accessible application windows in the isolated session."""
+        session = self._get_session()
+        info = session.info
+        # Prefer the compositor-side enumeration (sees every window KWin
+        # knows, including apps without an accessibility tree — H-2); fall
+        # back to AT-SPI when scripting is unavailable.
+        if info and info.dbus_address:
+            try:
+                return kwin_windows.list_windows_by_script(info.dbus_address)
+            except (RuntimeError, dbus.DBusException):
+                pass
         self._get_session()
         resp = self._run_atspi("list_windows")
         return resp["result"]
 
     def focus_window(self, app_name: str) -> str:
-        """Attempt to focus a window by application name."""
-        self._get_session()
+        """Focus a window by application name.
+
+        Activation goes through the KWin scripting API
+        (workspace.activeWindow = w) because AT-SPI grabFocus() does not move
+        compositor-level focus on Wayland (A-2). Falls back to the AT-SPI
+        path when scripting is unavailable.
+        """
+        session = self._get_session()
+        info = session.info
+        if info and info.dbus_address:
+            try:
+                return kwin_windows.activate_window_by_name(info.dbus_address, app_name)
+            except (RuntimeError, dbus.DBusException) as exc:
+                last_error = str(exc)
+        else:
+            last_error = "session has no D-Bus address"
         resp = self._run_atspi("focus_window", app_name=app_name)
-        return resp["result"]
+        result = resp["result"]
+        if "Focused" in result:
+            note = (
+                " (AT-SPI fallback: KWin scripting failed"
+                f" — {last_error}; focus may not have moved)"
+            )
+            return result + note
+        return result
 
     # ── D-Bus tools ───────────────────────────────────────────────────────
 

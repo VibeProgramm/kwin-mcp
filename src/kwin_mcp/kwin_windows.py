@@ -246,3 +246,233 @@ def _parse_payload(payload: str) -> list[WindowGeometry]:
             )
         )
     return geometries
+
+
+# ── Window activation + listing via KWin scripting (A-2 / H-2 fix) ───────
+#
+# AT-SPI grabFocus() on a top-level window does not move compositor-level
+# focus (Qt only marks the widget focused), so focus_window reported success
+# while the window stayed inactive. The KWin scripting API is the reliable
+# activation path (same mechanism kdotool uses): workspace.activeWindow = w.
+# Window listing through scripting also sees windows whose apps never
+# registered with AT-SPI (e.g. apps running before session_connect), which
+# the AT-SPI enumeration misses (H-2).
+#
+# JS templates written for kwin-mcp following KWin scripting docs; the
+# loadScript/run/callDBus cycle mirrors _fetch_window_geometries above
+# (same pattern as kdotool's tempfile + loadScript approach).
+
+
+_ACTIVATE_SCRIPT_TEMPLATE = """try {
+    var wanted = "__APP_NAME__".toLowerCase();
+    var wins = workspace.windowList();
+    var target = null;
+    for (var i = 0; i < wins.length; i++) {
+        var w = wins[i];
+        var cls = (w.resourceClass || "").toLowerCase();
+        var cap = (w.caption || "").toLowerCase();
+        var res = (w.resourceName || "").toLowerCase();
+        if (cls.indexOf(wanted) >= 0 || cap.indexOf(wanted) >= 0 || res.indexOf(wanted) >= 0) {
+            target = w;
+            if (w.normalWindow) { break; }
+        }
+    }
+    if (target) {
+        workspace.activeWindow = target;
+        callDBus("__BUS_NAME__", "__OBJECT_PATH__", "__INTERFACE_NAME__", "Push", "OK");
+    } else {
+        callDBus("__BUS_NAME__", "__OBJECT_PATH__", "__INTERFACE_NAME__", "Push", "not_found");
+    }
+} catch (e) {
+    callDBus("__BUS_NAME__", "__OBJECT_PATH__", "__INTERFACE_NAME__", "Push",
+        "ERROR " + e);
+}
+"""
+
+_LIST_SCRIPT_TEMPLATE = """try {
+    var wins = workspace.windowList();
+    var out = [];
+    for (var i = 0; i < wins.length; i++) {
+        var w = wins[i];
+        var active = (workspace.activeWindow === w) ? " [active]" : "";
+        var minimized = w.minimized ? " [minimized]" : "";
+        out.push(w.resourceClass + "\\t" + w.internalId + "\\t"
+            + (w.caption || "(untitled)") + "\\t" + w.pid + active + minimized);
+    }
+    callDBus("__BUS_NAME__", "__OBJECT_PATH__", "__INTERFACE_NAME__", "Push",
+        "OK\\n" + out.join("\\n"));
+} catch (e) {
+    callDBus("__BUS_NAME__", "__OBJECT_PATH__", "__INTERFACE_NAME__", "Push",
+        "ERROR " + e);
+}
+"""
+
+
+def parse_script_result(payload: str | None, app_name: str) -> str:
+    """Translate a scripting Push payload into a user-facing outcome string.
+
+    Args:
+        payload: The string delivered by the script's callDBus, or None on
+            timeout.
+        app_name: The app name the script searched for (used in messages).
+
+    Returns:
+        Outcome string; raises RuntimeError when the script produced no
+        result within the timeout.
+    """
+    if payload is None:
+        msg = f"KWin script timed out while activating '{app_name}'"
+        raise RuntimeError(msg)
+    if payload.startswith("ERROR "):
+        return f"KWin script error: {payload[6:]}"
+    if payload == "not_found":
+        return f"No window matching '{app_name}' found"
+    if payload.startswith("OK\n"):
+        return payload[3:]
+    return payload
+
+
+def _run_script_one_shot(
+    dbus_address: str,
+    script_text: str,
+    script_name: str,
+    *,
+    timeout: float = FETCH_TIMEOUT_S,
+) -> str | None:
+    """Run a one-shot KWin script and return its Push payload.
+
+    Shares the tempfile + loadScript/run/unload + callDBus result flow with
+    _fetch_window_geometries; returns the pushed string or None on timeout.
+    """
+    import dbus
+    import dbus.bus
+    import dbus.service
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.bus.BusConnection(dbus_address)
+
+    suffix = f"{os.getpid()}-{time.monotonic_ns() % 1_000_000}"
+    bus_name = f"org.kwin_mcp.script.{script_name}.pid{suffix}"
+    object_path = "/org/kwin_mcp/ScriptResult"
+    interface = "org.kwin_mcp.ScriptResult"
+    bus.request_name(bus_name, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+
+    received: dict[str, str] = {}
+    loop = GLib.MainLoop()
+
+    class _Sink(dbus.service.Object):
+        @dbus.service.method(interface, in_signature="s", out_signature="")
+        def Push(self, payload: str) -> None:  # noqa: N802 - D-Bus method name must match script call
+            received["payload"] = str(payload)
+            loop.quit()
+
+    _Sink(bus, object_path)
+    worker = threading.Thread(target=loop.run, daemon=True)
+    worker.start()
+
+    resolved = (
+        script_text.replace("__BUS_NAME__", bus_name)
+        .replace("__OBJECT_PATH__", object_path)
+        .replace("__INTERFACE_NAME__", interface)
+    )
+    script_id = -1
+    try:
+        with tempfile.TemporaryDirectory(prefix="kwinmcp-script-") as tmpdir:
+            script_path = os.path.join(tmpdir, "script.js")
+            with open(script_path, "w", encoding="utf-8") as handle:
+                handle.write(resolved)
+            script_id = bus.call_blocking(
+                "org.kde.KWin",
+                "/Scripting",
+                "org.kde.kwin.Scripting",
+                "loadScript",
+                "ss",
+                [script_path, f"{script_name}-{suffix}"],
+            )
+            if int(script_id) < 0:
+                raise RuntimeError("KWin refused to load script (scripting disabled?)")
+            bus.get_object("org.kde.KWin", f"/Scripting/Script{int(script_id)}").run(
+                dbus_interface="org.kde.kwin.Script"
+            )
+            deadline = time.monotonic() + timeout
+            while "payload" not in received and time.monotonic() < deadline:
+                time.sleep(0.05)
+    finally:
+        try:
+            if int(script_id) >= 0:
+                bus.call_blocking(
+                    "org.kde.KWin",
+                    "/Scripting",
+                    "org.kde.kwin.Scripting",
+                    "unloadScript",
+                    "s",
+                    [f"{script_name}-{suffix}"],
+                )
+        except Exception:
+            pass
+        loop.quit()
+        worker.join(timeout=2.0)
+
+    return received.get("payload")
+
+
+# Backwards-compatible aliases for the template names used in tests/docs.
+JS_ACTIVATE_BY_CLASS = _ACTIVATE_SCRIPT_TEMPLATE
+JS_LIST_WINDOWS = _LIST_SCRIPT_TEMPLATE
+
+
+def activate_window_by_name(dbus_address: str, app_name: str) -> str:
+    """Activate (compositor-focus) a window whose app/class/title matches.
+
+    Args:
+        dbus_address: Session bus address of the KWin instance.
+        app_name: Case-insensitive substring matched against the window's
+            resourceClass, caption and resourceName.
+
+    Returns:
+        Human-readable outcome; errors are returned as strings for the caller
+        (AutomationEngine) to translate into tool errors.
+    """
+    payload = _run_script_one_shot(
+        dbus_address,
+        _ACTIVATE_SCRIPT_TEMPLATE.replace("__APP_NAME__", app_name.replace('"', "")),
+        "kwinmcp-activate",
+    )
+    return parse_script_result(payload, app_name)
+
+
+def list_windows_by_script(dbus_address: str) -> str:
+    """List all compositor windows via KWin scripting.
+
+    Unlike the AT-SPI enumeration this sees every window the compositor knows
+    about, including apps that never registered an accessibility tree (H-2).
+
+    Args:
+        dbus_address: Session bus address of the KWin instance.
+
+    Returns:
+        Formatted window list; raises RuntimeError on scripting failures.
+    """
+    payload = _run_script_one_shot(dbus_address, _LIST_SCRIPT_TEMPLATE, "kwinmcp-list")
+    if payload is None:
+        msg = "KWin script timed out while listing windows"
+        raise RuntimeError(msg)
+    if payload.startswith("ERROR "):
+        msg = f"KWin script error: {payload[6:]}"
+        raise RuntimeError(msg)
+    if payload == "OK\n":
+        return "Applications (0):\n"
+    if not payload.startswith("OK\n"):
+        msg = f"Unexpected KWin script payload: {payload!r}"
+        raise RuntimeError(msg)
+
+    lines = ["Applications:"]
+    for line in payload[3:].splitlines():
+        fields = line.split("\t", 3)
+        if len(fields) != 4:
+            continue
+        resource_class, _internal_id, caption, extras = fields
+        lines.append(f'- {resource_class} "{caption}"{extras}')
+    return "\n".join(lines)
