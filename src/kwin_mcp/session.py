@@ -20,6 +20,23 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+# at-spi-bus-launcher is not on PATH and its location is distro-specific:
+# /usr/lib on Arch, /usr/libexec on Debian/Ubuntu/Fedora (ported from upstream
+# isac322/kwin-mcp#42).
+_AT_SPI_LAUNCHER_CANDIDATES = (
+    "/usr/libexec/at-spi-bus-launcher",
+    "/usr/lib/at-spi-bus-launcher",
+    "/usr/lib/at-spi2-core/at-spi-bus-launcher",
+)
+
+
+def _at_spi_bus_launcher() -> str:
+    """Locate the AT-SPI bus launcher binary for the current distribution."""
+    for candidate in _AT_SPI_LAUNCHER_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return shutil.which("at-spi-bus-launcher") or _AT_SPI_LAUNCHER_CANDIDATES[0]
+
 
 class SessionType(Enum):
     """Type of KWin session."""
@@ -381,7 +398,9 @@ trap cleanup EXIT TERM INT HUP
 # Start the AT-SPI accessibility bus.
 # ATSPI_DBUS_IMPLEMENTATION is set in _build_env() to force dbus-daemon
 # instead of dbus-broker (which reuses the host's AT-SPI bus).
-/usr/lib/at-spi-bus-launcher --launch-immediately &
+# The launcher path is distro-specific: resolved on the Python side
+# (_at_spi_bus_launcher) before this wrapper is assembled.
+{_at_spi_bus_launcher()} --launch-immediately &
 AT_SPI_PID=$!
 sleep 0.2
 

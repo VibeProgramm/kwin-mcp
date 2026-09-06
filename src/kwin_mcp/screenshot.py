@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 import dbus
 import dbus.bus
+
+# Upper bound for a single ScreenShot2 capture. Generous for a real capture
+# (tens of milliseconds) yet short enough that the spectacle fallback stays
+# responsive when KWin never answers (ported from upstream isac322/kwin-mcp#42).
+_CAPTURE_TIMEOUT_S = 5.0
 
 
 def capture_screenshot_to_file(
@@ -19,6 +25,11 @@ def capture_screenshot_to_file(
     output_dir: Path | None = None,
 ) -> Path:
     """Capture a screenshot and save to a file.
+
+    Tries the fast KWin ScreenShot2 D-Bus route first and falls back to the
+    spectacle CLI when D-Bus capture is unauthorized or unavailable (e.g. live
+    sessions without KWIN_SCREENSHOT_NO_PERMISSION_CHECKS, or minimal sessions
+    without spectacle installed) (ported from upstream isac322/kwin-mcp#42).
 
     Args:
         dbus_address: D-Bus session bus address for the isolated session.
@@ -36,12 +47,23 @@ def capture_screenshot_to_file(
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_path = output_dir / f"screenshot_{timestamp}.png"
 
-    _capture_via_spectacle(
-        dbus_address,
-        wayland_socket,
-        output_path=output_path,
-        include_cursor=include_cursor,
-    )
+    try:
+        return capture_screenshot_dbus(
+            dbus_address,
+            output_path,
+            include_cursor=include_cursor,
+        )
+    except (dbus.DBusException, RuntimeError) as exc:
+        try:
+            _capture_via_spectacle(
+                dbus_address,
+                wayland_socket,
+                output_path=output_path,
+                include_cursor=include_cursor,
+            )
+        except RuntimeError as fallback_exc:
+            msg = f"D-Bus screenshot failed ({exc}); spectacle fallback unusable ({fallback_exc})"
+            raise RuntimeError(msg) from fallback_exc
     return output_path
 
 
@@ -74,37 +96,65 @@ def capture_screenshot_dbus(
     screenshot_obj = bus.get_object("org.kde.KWin", "/org/kde/KWin/ScreenShot2")
     iface = dbus.Interface(screenshot_obj, "org.kde.KWin.ScreenShot2")
 
-    read_fd, write_fd = os.pipe()
-    try:
-        options = {"include-cursor": dbus.Boolean(include_cursor)}
-        results = iface.CaptureActiveScreen(options, dbus.types.UnixFd(write_fd))
-    finally:
-        os.close(write_fd)
-
-    try:
-        chunks = []
-        while True:
-            chunk = os.read(read_fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    finally:
-        os.close(read_fd)
-
-    data = b"".join(chunks)
+    options = {"include-cursor": dbus.Boolean(include_cursor)}
+    data, width, height, stride = _capture_raw_frame(iface, options)
     if not data:
         msg = "KWin ScreenShot2 returned no data"
         raise RuntimeError(msg)
-
-    width = int(results["width"])
-    height = int(results["height"])
-    stride = int(results["stride"])
 
     # KWin returns raw ARGB32_Premultiplied (Qt format 6) in native byte order.
     # On little-endian systems, bytes are stored as BGRA.
     img = Image.frombytes("RGBA", (width, height), data, "raw", "BGRA", stride)
     img.save(output_path, "PNG")
     return output_path
+
+
+def _capture_raw_frame(
+    iface: dbus.Interface,
+    options: dict[str, dbus.Boolean],
+) -> tuple[bytes, int, int, int]:
+    """Capture one raw frame over ScreenShot2, returning (data, w, h, stride).
+
+    KWin streams the pixels into the pipe before it answers the D-Bus call,
+    and a frame is far larger than the pipe buffer, so the pipe is drained by
+    a reader thread while the call is in flight (a synchronous drain after the
+    reply would deadlock both sides). The reader owns read_fd and closes it in
+    its finally block, keeping a still-blocked read from surviving the call.
+
+    The call carries an explicit timeout: a compositor that never answers
+    would otherwise burn dbus-python's 25s default before callers can fall
+    back to spectacle (ported from upstream isac322/kwin-mcp#42).
+
+    Unlike upstream, an empty frame is not an error here: the frame burst
+    path historically skipped empty frames, and keeping the check with the
+    callers preserves that behavior.
+    """
+    read_fd, write_fd = os.pipe()
+    chunks: list[bytes] = []
+
+    def drain() -> None:
+        try:
+            while True:
+                chunk = os.read(read_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(read_fd)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
+        results = iface.CaptureActiveScreen(
+            options,
+            dbus.types.UnixFd(write_fd),
+            timeout=_CAPTURE_TIMEOUT_S,
+        )
+    finally:
+        os.close(write_fd)
+        reader.join(timeout=_CAPTURE_TIMEOUT_S)
+
+    return b"".join(chunks), int(results["width"]), int(results["height"]), int(results["stride"])
 
 
 def capture_frame_burst(
@@ -176,29 +226,7 @@ def _capture_frame_burst_dbus(
         if now < target_time:
             time.sleep(target_time - now)
 
-        read_fd, write_fd = os.pipe()
-        try:
-            results = iface.CaptureActiveScreen(options, dbus.types.UnixFd(write_fd))
-        finally:
-            os.close(write_fd)
-        try:
-            chunks = []
-            while True:
-                chunk = os.read(read_fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        finally:
-            os.close(read_fd)
-
-        raw_frames.append(
-            (
-                b"".join(chunks),
-                int(results["width"]),
-                int(results["height"]),
-                int(results["stride"]),
-            )
-        )
+        raw_frames.append(_capture_raw_frame(iface, options))
 
     # Phase 2: Convert raw frames to PNG (timing-insensitive)
     frame_paths: list[Path] = []

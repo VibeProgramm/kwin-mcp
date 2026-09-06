@@ -338,19 +338,27 @@ class EISClient:
 
     def _setup(self) -> None:
         """Connect to KWin EIS and negotiate devices."""
-        eis_obj = self._bus.get_object("org.kde.KWin", "/org/kde/KWin/EIS/RemoteDesktop")
-        self._eis_iface = dbus.Interface(eis_obj, "org.kde.KWin.EIS.RemoteDesktop")
+        # KWin only exposes the EIS interface when it supports remote input;
+        # translate the D-Bus failure so callers can treat the input backend as
+        # optional (core.py degrades to "no input backend" on RuntimeError;
+        # ported from upstream isac322/kwin-mcp#42).
+        try:
+            eis_obj = self._bus.get_object("org.kde.KWin", "/org/kde/KWin/EIS/RemoteDesktop")
+            self._eis_iface = dbus.Interface(eis_obj, "org.kde.KWin.EIS.RemoteDesktop")
 
-        # Request all relevant capabilities
-        caps = (
-            _EI_CAP_POINTER
-            | _EI_CAP_POINTER_ABSOLUTE
-            | _EI_CAP_KEYBOARD
-            | _EI_CAP_TOUCH
-            | _EI_CAP_BUTTON
-            | _EI_CAP_SCROLL
-        )
-        result = self._eis_iface.connectToEIS(dbus.Int32(caps))
+            # Request all relevant capabilities
+            caps = (
+                _EI_CAP_POINTER
+                | _EI_CAP_POINTER_ABSOLUTE
+                | _EI_CAP_KEYBOARD
+                | _EI_CAP_TOUCH
+                | _EI_CAP_BUTTON
+                | _EI_CAP_SCROLL
+            )
+            result = self._eis_iface.connectToEIS(dbus.Int32(caps))
+        except dbus.DBusException as exc:
+            msg = f"KWin EIS interface unavailable: {exc}"
+            raise RuntimeError(msg) from exc
         fd = result[0].take()
         self._cookie = int(result[1])
 

@@ -396,7 +396,7 @@ sudo apt install wl-clipboard wtype wayland-utils
 
 ## Installation
 
-> **Note**: the `kwin-mcp` name on PyPI tracks the upstream project (`isac322/kwin-mcp`, v0.7.0, MCP SDK 1.x). This repository is the actively maintained fork (v0.8.0, MCP SDK 2.x); install it from git or from a source checkout. The `uvx kwin-mcp` config examples in the [Configuration](#configuration) section resolve to the PyPI package.
+> **Note**: the `kwin-mcp` name on PyPI tracks the upstream project (`isac322/kwin-mcp`, v0.7.0, MCP SDK 1.x). This repository is the actively maintained fork (v0.8.1, MCP SDK 2.x); install it from git or from a source checkout. The `uvx kwin-mcp` config examples in the [Configuration](#configuration) section resolve to the PyPI package.
 
 ### Using uv (recommended)
 
