@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-07
+
 ### Fixed
 
+- `session_start`/`session_connect` crashed entirely when KWin's EIS D-Bus interface was unavailable: `EISClient._setup` left `get_object`/`Interface`/`connectToEIS` unprotected, and `dbus.DBusException` is not a `RuntimeError` (the only type core.py catches to degrade to "no input backend"). The dbus block now raises `RuntimeError("KWin EIS interface unavailable: {exc}")` with error chaining (adopted from upstream isac322/kwin-mcp#42, fix e)
+- The bash wrapper hardcoded the Arch-only `/usr/lib/at-spi-bus-launcher` path: on Debian/Ubuntu/Fedora the binary lives in `/usr/libexec` (or `/usr/lib/at-spi2-core`), so the launcher silently no-oped and the session's accessibility bus was dead. The path is now resolved on the Python side before the wrapper is assembled — first existing candidate from `/usr/libexec`, `/usr/lib`, `/usr/lib/at-spi2-core`, then `shutil.which`, then the Arch default (adopted from upstream isac322/kwin-mcp#42, fix c)
+- `capture_screenshot_to_file` unconditionally invoked the spectacle CLI, contrary to its own documentation, and minimal/virtual sessions may not have spectacle installed at all. It now tries the ScreenShot2 D-Bus capture first and falls back to spectacle; when both fail, the error carries both causes. The shared single-frame helper drains the pixel pipe concurrently with the D-Bus call (KWin streams pixels before replying) and carries a 5s timeout instead of dbus-python's 25s default (adopted from upstream isac322/kwin-mcp#42, fix f)
 - `session_start` could hang forever when the KWin wrapper never printed `READY` (dead KWin, missing binaries) or waited forever for the Wayland socket: the parent now reads the wrapper's stdout with a 25s deadline, and the wrapper's socket wait is bounded (150 x 0.1s = 15s, reports `NOSOCKET` and exits 1). Startup failures now include KWin's stderr, and `launch_app` no longer leaks the host `DISPLAY` into isolated sessions, where X11 applications would silently open on the user's real desktop (adopted from upstream isac322/kwin-mcp#50)
 - EIS input injection started emulating before the compositor had resumed the devices, which libei rejects (`device is not emulating`) and which silently dropped every injected event: `_negotiate_devices` now waits for `EI_EVENT_DEVICE_RESUMED` on the pointer and keyboard before `ei_device_start_emulating` and fails with an explicit error if a device never resumes (adopted from upstream isac322/kwin-mcp#42)
 - Segfault on Python 3.14 caused by missing `argtypes` on variadic `ei_seat_bind_capabilities` ctypes call
