@@ -48,10 +48,10 @@
   ],
   "license": "MIT",
   "author": "Byeonghoon Yoo <bhyoo@bhyoo.com>",
-  "homepage": "https://github.com/isac322/kwin-mcp/tree/main/integrations/opencode/plugin",
+  "homepage": "https://github.com/VibeProgramm/kwin-mcp/tree/main/integrations/opencode/plugin",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/isac322/kwin-mcp.git",
+    "url": "git+https://github.com/VibeProgramm/kwin-mcp.git",
     "directory": "integrations/opencode/plugin"
   },
   "bugs": {

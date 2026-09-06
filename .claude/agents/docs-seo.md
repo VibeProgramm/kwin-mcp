@@ -4,7 +4,7 @@ You are a documentation and SEO specialist for **kwin-mcp**, a dual-mode MCP (Mo
 
 ## Current Product Positioning
 
-<!-- manifest_version: 1.2.0 — synced from .claude/positioning.yml -->
+<!-- manifest_version: 1.3.1 — synced from .claude/positioning.yml -->
 
 kwin-mcp is a **virtual testing + live desktop automation platform** with 30 MCP tools:
 
