@@ -120,6 +120,7 @@ _EI_CAP_KEYBOARD = 1 << 2
 _EI_CAP_TOUCH = 1 << 3
 _EI_CAP_SCROLL = 1 << 4
 _EI_CAP_BUTTON = 1 << 5
+_EI_CAP_TEXT = 1 << 6  # libei >= 1.6: keysym/UTF-8 input resolved server-side
 
 # EI event types
 _EI_EVENT_CONNECT = 1
@@ -130,6 +131,68 @@ _EI_EVENT_DEVICE_RESUMED = 8
 
 # Scroll axis values (in libei, scroll is in pixels)
 _SCROLL_STEP_PIXELS = 15.0
+
+# XKB keysyms for control characters (XK_Return, XK_Tab)
+_XKB_KEYSYM_RETURN = 0xFF0D
+_XKB_KEYSYM_TAB = 0xFF09
+
+# XKB keysyms for named special keys (from xkbcommon-keysyms.h). The server
+# resolves these through its own keymap, so no client-side keymap knowledge
+# is required.
+_KEYSYM_NAME_MAP: dict[str, int] = {
+    "return": _XKB_KEYSYM_RETURN,
+    "enter": _XKB_KEYSYM_RETURN,
+    "tab": _XKB_KEYSYM_TAB,
+    "escape": 0xFF1B,
+    "backspace": 0xFF08,
+    "delete": 0xFFFF,
+    "space": 0x20,
+    "up": 0xFF52,
+    "down": 0xFF54,
+    "left": 0xFF51,
+    "right": 0xFF53,
+    "home": 0xFF50,
+    "end": 0xFF57,
+    "page_up": 0xFF55,
+    "pageup": 0xFF55,
+    "page_down": 0xFF56,
+    "pagedown": 0xFF56,
+    "insert": 0xFF63,
+    "print": 0xFF61,
+    "scroll_lock": 0xFF14,
+    "pause": 0xFF13,
+    "caps_lock": 0xFFE5,
+    "num_lock": 0xFF7F,
+    "menu": 0xFF67,
+    "f1": 0xFFBE,
+    "f2": 0xFFBF,
+    "f3": 0xFFC0,
+    "f4": 0xFFC1,
+    "f5": 0xFFC2,
+    "f6": 0xFFC3,
+    "f7": 0xFFC4,
+    "f8": 0xFFC5,
+    "f9": 0xFFC6,
+    "f10": 0xFFC7,
+    "f11": 0xFFC8,
+    "f12": 0xFFC9,
+}
+
+# Printable ASCII → XKB keysym. XKB assigns Latin-1 keysyms to the same
+# codepoints as ASCII, so this table is a straight pass-through for 0x20-0x7E.
+_ASCII_TO_KEYSYM: dict[str, int] = {chr(c): c for c in range(0x20, 0x7F)}
+_ASCII_TO_KEYSYM["\n"] = _XKB_KEYSYM_RETURN
+_ASCII_TO_KEYSYM["\t"] = _XKB_KEYSYM_TAB
+
+
+def ascii_char_to_keysym(char: str) -> int | None:
+    """Map a single character to its XKB keysym, or None if not mappable."""
+    return _ASCII_TO_KEYSYM.get(char)
+
+
+def key_name_to_keysym(name: str) -> int | None:
+    """Map a key name (e.g. 'Return', 'F5') to its XKB keysym, or None."""
+    return _KEYSYM_NAME_MAP.get(name.lower())
 
 
 def _load_libei() -> ctypes.CDLL:
@@ -204,6 +267,21 @@ def _load_libei() -> ctypes.CDLL:
     lib.ei_device_stop_emulating.restype = None
     lib.ei_device_stop_emulating.argtypes = [ctypes.c_void_p]
 
+    # Text input (libei >= 1.6). Events are resolved by the server: keysyms go
+    # through the server's keymap (EisDevice::sendKeySym in KWin), UTF-8 text
+    # goes through the input method. These symbols are missing on older libei;
+    # guard with hasattr so the module still loads there.
+    if hasattr(lib, "ei_device_text_keysym"):
+        lib.ei_device_text_keysym.restype = None
+        lib.ei_device_text_keysym.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        ]
+    if hasattr(lib, "ei_device_text_utf8"):
+        lib.ei_device_text_utf8.restype = None
+        lib.ei_device_text_utf8.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
     # Touch functions
     lib.ei_device_touch_new.restype = ctypes.c_void_p
     lib.ei_device_touch_new.argtypes = [ctypes.c_void_p]
@@ -250,6 +328,7 @@ class EISClient:
         self._pointer: int = 0  # absolute pointer device
         self._keyboard: int = 0  # keyboard device
         self._touch_device: int = 0  # touch-capable device
+        self._text_device: int = 0  # text device (libei >= 1.6)
         self._eis_iface: dbus.Interface | None = None
         self._next_touch_id: int = 0  # auto-increment touch ID
         self._active_touches: dict[int, int] = {}  # touch_id -> ctypes pointer
@@ -342,6 +421,17 @@ class EISClient:
             _get_libei().ei_device_start_emulating(self._keyboard, 0)
         if self._touch_device and self._touch_device not in (self._pointer, self._keyboard):
             _get_libei().ei_device_start_emulating(self._touch_device, 0)
+        if self._text_device and self._text_device not in (
+            self._pointer,
+            self._keyboard,
+            self._touch_device,
+        ):
+            _get_libei().ei_device_start_emulating(self._text_device, 0)
+
+    @property
+    def has_text_device(self) -> bool:
+        """Whether an EIS text device was negotiated (libei >= 1.6 + KWin 6.7+)."""
+        return self._text_device != 0
 
     def _bind_seat_capabilities(self, event: int) -> None:
         """Bind to all available capabilities on the seat."""
@@ -355,6 +445,7 @@ class EISClient:
             _EI_CAP_TOUCH,
             _EI_CAP_BUTTON,
             _EI_CAP_SCROLL,
+            _EI_CAP_TEXT,
         ]:
             if _get_libei().ei_seat_has_capability(seat, cap):
                 bind_list.append(cap)
@@ -373,6 +464,7 @@ class EISClient:
         has_abs = _get_libei().ei_device_has_capability(device, _EI_CAP_POINTER_ABSOLUTE)
         has_kbd = _get_libei().ei_device_has_capability(device, _EI_CAP_KEYBOARD)
         has_touch = _get_libei().ei_device_has_capability(device, _EI_CAP_TOUCH)
+        has_text = _get_libei().ei_device_has_capability(device, _EI_CAP_TEXT)
 
         # Prefer absolute pointer device
         if has_abs and not self._pointer:
@@ -381,6 +473,8 @@ class EISClient:
             self._keyboard = _get_libei().ei_device_ref(device)
         if has_touch and not self._touch_device:
             self._touch_device = _get_libei().ei_device_ref(device)
+        if has_text and not self._text_device:
+            self._text_device = _get_libei().ei_device_ref(device)
 
     def _now_us(self) -> int:
         """Current time in microseconds."""
@@ -424,6 +518,32 @@ class EISClient:
         """Press/release a key (evdev keycode)."""
         _get_libei().ei_device_keyboard_key(self._keyboard, keycode, state)
         _get_libei().ei_device_frame(self._keyboard, self._now_us())
+        self._flush()
+
+    def text_keysym(self, keysym: int, state: int) -> None:
+        """Press/release a key by XKB keysym via the EIS text device.
+
+        Requires libei >= 1.6 and a KWin EIS server with TEXT support; the
+        server resolves the keysym through its own keymap, so the client needs
+        no keymap knowledge.
+        """
+        if not self._text_device:
+            msg = "No EIS text device available (libei >= 1.6 required)"
+            raise RuntimeError(msg)
+        _get_libei().ei_device_text_keysym(self._text_device, keysym, state)
+        _get_libei().ei_device_frame(self._text_device, self._now_us())
+        self._flush()
+
+    def text_utf8(self, text: str) -> None:
+        """Send a UTF-8 string through the EIS text device.
+
+        The server injects it via its input method (KWin: inputMethod()->sendText).
+        """
+        if not self._text_device:
+            msg = "No EIS text device available (libei >= 1.6 required)"
+            raise RuntimeError(msg)
+        _get_libei().ei_device_text_utf8(self._text_device, text.encode("utf-8"))
+        _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
 
     def touch_down(self, x: float, y: float) -> int:
@@ -477,6 +597,14 @@ class EISClient:
             _get_libei().ei_device_stop_emulating(self._touch_device)
             _get_libei().ei_device_unref(self._touch_device)
             self._touch_device = 0
+        if self._text_device and self._text_device not in (
+            self._pointer,
+            self._keyboard,
+            self._touch_device,
+        ):
+            _get_libei().ei_device_stop_emulating(self._text_device)
+            _get_libei().ei_device_unref(self._text_device)
+            self._text_device = 0
         if self._pointer:
             _get_libei().ei_device_stop_emulating(self._pointer)
             _get_libei().ei_device_unref(self._pointer)
@@ -695,7 +823,26 @@ class InputBackend:
         self._client.pointer_button(btn_code, _RELEASED)
 
     def keyboard_type(self, text: str) -> None:
-        """Type a string of text character by character."""
+        """Type a string of text character by character.
+
+        Uses the EIS text device (keysym per character, resolved server-side)
+        when available (libei >= 1.6 + KWin 6.7+). This delivers keys regardless
+        of which keymap the server uses, unlike the bare-keycode path which
+        assumes a US QWERTY keymap. Falls back to the legacy keycode path on
+        servers without TEXT support.
+        """
+        if self._client.has_text_device:
+            for char in text:
+                keysym = ascii_char_to_keysym(char)
+                if keysym is None:
+                    continue  # non-ASCII → use keyboard_type_unicode instead
+                self._client.text_keysym(keysym, _PRESSED)
+                time.sleep(0.01)
+                self._client.text_keysym(keysym, _RELEASED)
+                time.sleep(0.02)
+            return
+
+        # Legacy path: bare evdev keycodes (assumes US QWERTY keymap server-side)
         for char in text:
             entry = _CHAR_KEY_MAP.get(char)
             if entry is None:
@@ -719,11 +866,25 @@ class InputBackend:
     def keyboard_key(self, key: str) -> None:
         """Press a key combination (e.g., 'ctrl+c', 'Return', 'alt+F4').
 
-        Supports modifier combinations with '+' separator.
+        Supports modifier combinations with '+' separator. Bare keys (no
+        modifiers) are routed through the EIS text device when available, so
+        the server resolves them via its own keymap; modifier combos keep the
+        bare-keycode path (which works reliably for shortcuts).
         """
         modifiers, keycode = _parse_key_combo(key)
         if keycode is None:
             return
+
+        if not modifiers and self._client.has_text_device:
+            # Text/special keys resolved server-side by keysym
+            keysym = key_name_to_keysym(key) or (
+                ascii_char_to_keysym(key) if len(key) == 1 else None
+            )
+            if keysym is not None:
+                self._client.text_keysym(keysym, _PRESSED)
+                time.sleep(0.01)
+                self._client.text_keysym(keysym, _RELEASED)
+                return
 
         # Press modifiers
         for mod in modifiers:
