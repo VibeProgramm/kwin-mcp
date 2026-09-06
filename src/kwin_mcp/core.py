@@ -52,6 +52,27 @@ _INSTALL_HINTS: dict[str, str] = {
 }
 
 
+def clip_to_screen(x: int, y: int, screen_size: tuple[int, int] | None) -> tuple[int, int, bool]:
+    """Clip coordinates to the known screen bounds.
+
+    Args:
+        x, y: Requested coordinates.
+        screen_size: Known (width, height) of the virtual screen, or None when
+            the size is unknown (live sessions): only the lower bound (>= 0)
+            is enforced and no upper-bound clipping happens.
+
+    Returns:
+        (clipped_x, clipped_y, clipped) where clipped is True when either
+        coordinate was adjusted.
+    """
+    cx = max(0, x)
+    cy = max(0, y)
+    if screen_size is not None:
+        cx = min(cx, screen_size[0] - 1)
+        cy = min(cy, screen_size[1] - 1)
+    return cx, cy, (cx != x or cy != y)
+
+
 def _parse_mouse_button(button: str) -> MouseButton:
     """Resolve a button name to MouseButton; invalid names are a ToolError."""
     try:
@@ -73,6 +94,7 @@ class AutomationEngine:
         self._clipboard_enabled: bool = False
         self._wl_copy_proc: subprocess.Popen[bytes] | None = None
         self._keep_screenshots: bool = False
+        self._screen_size: tuple[int, int] | None = None
 
     # ── Private helpers ───────────────────────────────────────────────────
 
@@ -197,6 +219,7 @@ class AutomationEngine:
             tool_error("Session already running. Call session_stop first.")
 
         self._clipboard_enabled = enable_clipboard
+        self._screen_size = (screen_width, screen_height)
 
         self._session = Session()
         config = SessionConfig(
@@ -271,6 +294,7 @@ class AutomationEngine:
         session._keep_screenshots = keep_screenshots
         self._session = session
         self._keep_screenshots = keep_screenshots
+        self._screen_size = None  # live sessions: unknown size, lower bound only
 
         # Clipboard is always available on live sessions
         self._clipboard_enabled = True
@@ -320,6 +344,7 @@ class AutomationEngine:
         self._session = None
         self._input = None
         self._keep_screenshots = False
+        self._screen_size = None
 
         return "Disconnected from live session." if is_live else "Session stopped."
 
@@ -391,11 +416,14 @@ class AutomationEngine:
     ) -> str:
         """Click at coordinates in the isolated session."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         btn = _parse_mouse_button(button)
         click_count = 3 if triple else (2 if double else 1)
         inp.mouse_click(x, y, btn, click_count=click_count, modifiers=modifiers, hold_ms=hold_ms)
 
         desc = f"Clicked {button} at ({x}, {y})"
+        if clipped:
+            desc += " (clipped to screen bounds)"
         if triple:
             desc += " (triple)"
         elif double:
@@ -415,8 +443,11 @@ class AutomationEngine:
     ) -> str:
         """Move the mouse cursor to coordinates without clicking."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         inp.mouse_move(x, y)
         result = f"Mouse moved to ({x}, {y})"
+        if clipped:
+            result += " (clipped to screen bounds)"
         return self._with_frame_capture(result, screenshot_after_ms)
 
     def mouse_scroll(
@@ -430,10 +461,13 @@ class AutomationEngine:
     ) -> str:
         """Scroll at coordinates in the isolated session."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         inp.mouse_scroll(x, y, delta, horizontal=horizontal, discrete=discrete, steps=steps)
         direction = "horizontal" if horizontal else "vertical"
         mode = "discrete" if discrete else "smooth"
         desc = f"Scrolled {direction} ({mode}) by {delta} at ({x}, {y})"
+        if clipped:
+            desc += " (clipped to screen bounds)"
         if steps > 1:
             desc += f" in {steps} steps"
         return desc
@@ -554,8 +588,11 @@ class AutomationEngine:
     ) -> str:
         """Tap at coordinates using touch input."""
         inp = self._get_input()
+        x, y, clipped = clip_to_screen(x, y, self._screen_size)
         inp.touch_tap(x, y, hold_ms=hold_ms)
         desc = f"Touch tap at ({x}, {y})"
+        if clipped:
+            desc += " (clipped to screen bounds)"
         if hold_ms > 0:
             desc += f" held {hold_ms}ms"
         return self._with_frame_capture(desc, screenshot_after_ms)
@@ -571,8 +608,12 @@ class AutomationEngine:
     ) -> str:
         """Swipe from one point to another using single-finger touch input."""
         inp = self._get_input()
+        from_x, from_y, clipped = clip_to_screen(from_x, from_y, self._screen_size)
+        to_x, to_y, clipped2 = clip_to_screen(to_x, to_y, self._screen_size)
         inp.touch_swipe(from_x, from_y, to_x, to_y, duration_ms=duration_ms)
         desc = f"Touch swipe from ({from_x}, {from_y}) to ({to_x}, {to_y}) in {duration_ms}ms"
+        if clipped or clipped2:
+            desc += " (clipped to screen bounds)"
         return self._with_frame_capture(desc, screenshot_after_ms)
 
     def touch_pinch(
