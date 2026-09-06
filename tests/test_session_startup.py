@@ -14,6 +14,10 @@ Adopted from upstream isac322/kwin-mcp PR #50:
 - Startup failures now include KWin's stderr (pattern from upstream PR #42):
   the old code read stderr after ``stop()``, which had already cleared
   ``self._process``, so the message was always empty.
+- The hardcoded ``/usr/lib/at-spi-bus-launcher`` wrapper path (Arch-only)
+  silently no-oped on Debian/Ubuntu/Fedora (``/usr/libexec/...``), leaving a
+  dead accessibility bus: the launcher is now resolved on the Python side
+  before the wrapper is assembled (upstream PR #42, fix c).
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import subprocess
 from types import SimpleNamespace
 from typing import Any, cast
 
+import kwin_mcp.session as session_module
 from kwin_mcp.session import Session, SessionConfig, SessionInfo
 
 
@@ -80,6 +85,46 @@ def test_wrapper_script_bounded_socket_wait_and_display_unset() -> None:
     assert "seq 1 150" in script
     assert "exit 1" in script
     assert "-u DISPLAY" in script
+
+
+def test_at_spi_launcher_prefers_existing_candidate(monkeypatch, tmp_path) -> None:
+    """The first existing candidate wins: on Debian/Ubuntu/Fedora the launcher
+    lives in /usr/libexec, and that path must land in the wrapper."""
+    libexec = tmp_path / "libexec-launcher"
+    libexec.write_text("")
+    monkeypatch.setattr(
+        session_module,
+        "_AT_SPI_LAUNCHER_CANDIDATES",
+        (str(libexec), "/nonexistent/a", "/nonexistent/b"),
+    )
+    monkeypatch.setattr(session_module.shutil, "which", lambda name: "/from-which/launcher")
+    assert session_module._at_spi_bus_launcher() == str(libexec)
+
+
+def test_at_spi_launcher_falls_back_to_which(monkeypatch) -> None:
+    """No candidate exists → shutil.which, then the Arch default as last resort."""
+    monkeypatch.setattr(
+        session_module, "_AT_SPI_LAUNCHER_CANDIDATES", ("/nonexistent/a", "/nonexistent/b")
+    )
+    monkeypatch.setattr(
+        session_module.shutil,
+        "which",
+        lambda name: "/usr/local/bin/at-spi-bus-launcher",
+    )
+    assert session_module._at_spi_bus_launcher() == "/usr/local/bin/at-spi-bus-launcher"
+
+    monkeypatch.setattr(session_module.shutil, "which", lambda name: None)
+    assert session_module._at_spi_bus_launcher() == "/nonexistent/a"
+
+
+def test_wrapper_script_contains_resolved_launcher(monkeypatch) -> None:
+    """The wrapper embeds the resolved launcher path, not a hardcoded one."""
+    monkeypatch.setattr(session_module, "_at_spi_bus_launcher", lambda: "/resolved/launcher")
+    session = Session()
+    session._socket_name = "wayland-mcp-test"
+    script = session._build_wrapper_script(SessionConfig())
+    assert "/resolved/launcher --launch-immediately" in script
+    assert "/usr/lib/at-spi-bus-launcher" not in script
 
 
 def test_launch_app_strips_host_display(monkeypatch, tmp_path) -> None:
