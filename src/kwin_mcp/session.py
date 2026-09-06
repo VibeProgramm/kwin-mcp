@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import shlex
 import shutil
 import signal
 import subprocess
@@ -29,13 +30,19 @@ _AT_SPI_LAUNCHER_CANDIDATES = (
     "/usr/lib/at-spi2-core/at-spi-bus-launcher",
 )
 
+# Last-resort default when no candidate exists and PATH lookup fails: the
+# Arch layout (the primary development platform). A literal rather than a
+# candidate index so reordering _AT_SPI_LAUNCHER_CANDIDATES cannot silently
+# repoint the fallback at another distro's path.
+_AT_SPI_LAUNCHER_FALLBACK = "/usr/lib/at-spi-bus-launcher"
+
 
 def _at_spi_bus_launcher() -> str:
     """Locate the AT-SPI bus launcher binary for the current distribution."""
     for candidate in _AT_SPI_LAUNCHER_CANDIDATES:
         if Path(candidate).exists():
             return candidate
-    return shutil.which("at-spi-bus-launcher") or _AT_SPI_LAUNCHER_CANDIDATES[0]
+    return shutil.which("at-spi-bus-launcher") or _AT_SPI_LAUNCHER_FALLBACK
 
 
 class SessionType(Enum):
@@ -400,7 +407,7 @@ trap cleanup EXIT TERM INT HUP
 # instead of dbus-broker (which reuses the host's AT-SPI bus).
 # The launcher path is distro-specific: resolved on the Python side
 # (_at_spi_bus_launcher) before this wrapper is assembled.
-{_at_spi_bus_launcher()} --launch-immediately &
+{shlex.quote(_at_spi_bus_launcher())} --launch-immediately &
 AT_SPI_PID=$!
 sleep 0.2
 
