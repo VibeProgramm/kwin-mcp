@@ -7,6 +7,7 @@ Can be used directly from the CLI or wrapped by the MCP server.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -23,6 +24,8 @@ from kwin_mcp.errors import ToolError, tool_error
 from kwin_mcp.input import InputBackend, MouseButton
 from kwin_mcp.screenshot import capture_frame_burst, capture_screenshot_to_file
 from kwin_mcp.session import LiveSession, Session, SessionConfig
+
+logger = logging.getLogger(__name__)
 
 # Install hints for external binaries
 _INSTALL_HINTS: dict[str, str] = {
@@ -246,7 +249,10 @@ class AutomationEngine:
         time.sleep(0.5)
         try:
             self._input = InputBackend(info.dbus_address)
-        except RuntimeError:
+        except RuntimeError as exc:
+            logger.warning(
+                "KWin EIS input backend unavailable, degrading to no input backend: %s", exc
+            )
             self._input = None
 
         input_status = "Input backend: KWin EIS" if self._input else "No input backend available"
@@ -306,7 +312,10 @@ class AutomationEngine:
         try:
             self._input = InputBackend(dbus_addr)
             result += "\nInput backend: KWin EIS"
-        except RuntimeError:
+        except RuntimeError as exc:
+            logger.warning(
+                "KWin EIS input backend unavailable, falling back to ydotool if present: %s", exc
+            )
             self._input = None
             if shutil.which("ydotool"):
                 result += "\nInput backend: ydotool (EIS unavailable)"
