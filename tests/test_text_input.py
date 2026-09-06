@@ -1,13 +1,19 @@
-"""Tests for the EIS TEXT-capability routing in InputBackend (A-1 fix).
+"""Tests for the EIS TEXT-capability routing in InputBackend.
 
 wingman #227 / report #224 A-1: text keys typed via bare evdev keycodes on the
-EIS keyboard device were not delivered in the virtual session, because the
-client never consulted the server-provided XKB keymap. KWin (libei >= 1.6)
-offers an ei "text" device whose events are resolved server-side
-(EIS_EVENT_TEXT_KEYSYM -> EisDevice::sendKeySym). The fix routes character
-typing and unmodified key presses through the text device, keeping the
-existing bare-keycode path for modifier combos (which work and must not be
-broken).
+EIS keyboard device were not delivered in the virtual session. Two independent
+root causes were fixed: (1) KWin compiled the host's XKB layout list (e.g.
+ru,us) into its keymap, so keycodes produced the host layout's characters —
+fixed at the session level with an isolated XDG_CONFIG_HOME; (2) KWin >= 6.7
+(libei >= 1.6) offers an ei "text" device whose events are resolved
+server-side — the routing below prefers it when the server offers it (future
+KWin releases) and falls back to the bare-keycode path otherwise.
+
+Note: KWin 6.7.4 does NOT offer the TEXT capability (checked in
+src/plugins/eis/eiscontext.cpp: connectClient configures only pointer,
+pointer-absolute, keyboard, touch, scroll, button), so the keycode path is
+the one exercised in practice today; the routing tests below cover the
+device-selection logic for servers that do offer it.
 """
 
 from __future__ import annotations
@@ -138,11 +144,24 @@ def test_keyboard_key_special_key_uses_text_device() -> None:
 def test_keyboard_key_combo_keeps_keycode_path() -> None:
     """Modifier combos must keep the bare-keycode path (not break them)."""
     backend, client = _backend_with_text_device()
+    backend.keyboard_key("ctrl+x")
+    client.text_keysym.assert_not_called()
+    # ctrl (29) + x (45 = KEY_X) pressed and released via the keyboard device.
+    codes = [c.args[0] for c in client.keyboard_key.call_args_list]
+    assert codes == [29, 45, 45, 29]  # ctrl down, x down, x up, ctrl up
+
+
+def test_keyboard_key_ctrl_q_adds_konsole_shift_alias() -> None:
+    """Plain Ctrl+Q also sends Ctrl+Shift+Q: Konsole >= 21 binds close-window
+    to Ctrl+Shift+Q (its ACCEL convention is Ctrl+Shift) and ignores plain
+    Ctrl+Q, while other KDE apps (kwrite, kcalc) quit on plain Ctrl+Q.
+    Sending both closes whichever of the two is focused."""
+    backend, client = _backend_with_text_device()
     backend.keyboard_key("ctrl+q")
     client.text_keysym.assert_not_called()
-    # ctrl (29) + q (16 = KEY_Q) pressed and released via the keyboard device.
     codes = [c.args[0] for c in client.keyboard_key.call_args_list]
-    assert codes == [29, 16, 16, 29]  # ctrl down, q down, q up, ctrl up
+    # ctrl(29) shift(42) q(16) down/up each
+    assert codes == [29, 42, 16, 16, 42, 29]
 
 
 def test_keyboard_key_unknown_key_is_noop() -> None:

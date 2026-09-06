@@ -57,7 +57,7 @@ def test_wtype_receives_session_env(monkeypatch) -> None:
 
 
 def test_wtype_failure_falls_back_to_clipboard(monkeypatch) -> None:
-    """A wtype failure (e.g. missing Wayland socket) is retried via wl-copy."""
+    """A wtype failure (e.g. missing virtual-keyboard protocol) is retried via wl-copy."""
     monkeypatch.setattr(shutil, "which", lambda name: name in ("wtype", "wl-copy"))
 
     def fake_run(cmd: list[str], env: dict[str, str], **kwargs: object) -> MagicMock:
@@ -84,7 +84,11 @@ def test_wtype_failure_falls_back_to_clipboard(monkeypatch) -> None:
     assert ok is True
     assert captured["cmd"] == ["wl-copy", "--", "héllo"]
     assert captured["env"] == _SESSION_ENV  # fallback reuses the session env
-    backend.keyboard_key.assert_called_once_with("ctrl+v")
+    # Paste keys: Konsole binds paste to Ctrl+Shift+V, most apps Ctrl+V; the
+    # trailing Returns commit the paste in shells (the second one satisfies
+    # the ^V quoted-insert state the unbound Ctrl+V leaves in zsh).
+    sent = [call.args[0] for call in backend.keyboard_key.call_args_list]
+    assert sent == ["ctrl+shift+v", "ctrl+v", "return", "return"]
 
 
 def test_no_tools_returns_false(monkeypatch) -> None:

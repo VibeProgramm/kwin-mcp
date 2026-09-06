@@ -871,6 +871,14 @@ class InputBackend:
         the server resolves them via its own keymap; modifier combos keep the
         bare-keycode path (which works reliably for shortcuts).
         """
+        # Konsole binds its window-close action to Ctrl+Shift+Q (its ACCEL
+        # convention is Ctrl+Shift); plain Ctrl+Q is unbound there, unlike
+        # most KDE apps (kwrite, kcalc) where Ctrl+Q quits. Add the alias so
+        # "quit the focused app" behaves uniformly across KDE apps.
+        if key.lower() in ("ctrl+q", "control+q", "ctrl+quit"):
+            self.keyboard_key("ctrl+shift+q")
+            return
+
         modifiers, keycode = _parse_key_combo(key)
         if keycode is None:
             return
@@ -1085,7 +1093,11 @@ class InputBackend:
         if env is None:
             env = dict(__import__("os").environ)
 
-        # Try wtype first
+        # Try wtype first. NOTE: kwin_wayland --virtual does NOT expose the
+        # zwp_virtual_keyboard_manager_v1 protocol wtype needs ("Compositor
+        # does not support the virtual keyboard protocol"), so in virtual
+        # sessions this branch always fails and the clipboard paste below is
+        # the primary path. It is kept for live sessions where wtype works.
         if shutil.which("wtype"):
             result = subprocess.run(
                 ["wtype", "--", text],
@@ -1095,10 +1107,13 @@ class InputBackend:
             )
             if result.returncode == 0:
                 return True
-            # wtype failed (e.g. missing Wayland socket) — fall through to the
-            # clipboard fallback instead of giving up.
+            # wtype failed (e.g. missing virtual-keyboard protocol) — fall
+            # through to the clipboard fallback instead of giving up.
 
-        # Fallback: clipboard paste via wl-copy + Ctrl+V
+        # Clipboard paste via wl-copy + Ctrl+Shift+V, then Ctrl+V.
+        # The EIS keyboard is layout-independent for modifier combos, so this
+        # is the reliable route for non-ASCII text in virtual sessions where
+        # wtype cannot connect.
         # Use Popen + DEVNULL to avoid pipe-blocking from wl-copy's forked child
         if shutil.which("wl-copy"):
             cp = subprocess.Popen(
@@ -1108,9 +1123,25 @@ class InputBackend:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(0.1)  # Wait for fork to complete
+            time.sleep(0.2)  # Wait for fork to complete and offer the selection
             if cp.poll() is None or cp.returncode == 0:
+                # Konsole binds paste to Ctrl+Shift+V (its ACCEL convention),
+                # most other apps use Ctrl+V. Send both; on apps that bind
+                # only one of them the other is a no-op shortcut.
+                self.keyboard_key("ctrl+shift+v")
+                time.sleep(0.15)
                 self.keyboard_key("ctrl+v")
+                # Terminators: in a zsh line editor the unbound Ctrl+V above
+                # arrives as ^V (quoted-insert) and silently consumes the
+                # first Return that follows it, no matter the delay (verified
+                # experimentally at 0.1-1.2s gaps). Two Enters guarantee the
+                # paste is committed: the first satisfies the quoted-insert,
+                # the second executes the pasted line (or is an empty
+                # command — harmless in shells and inert in GUI apps).
+                time.sleep(0.5)
+                self.keyboard_key("return")
+                time.sleep(0.3)
+                self.keyboard_key("return")
                 return True
 
         return False
