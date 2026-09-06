@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-07
+
+### Fixed
+
+- The last-resort fallback of the at-spi-bus-launcher resolver returned `candidates[0]` (`/usr/libexec/...`, the Debian/Ubuntu/Fedora layout) when no candidate file existed and `shutil.which` found nothing — a dead path on Arch. The fallback is now the Arch default `/usr/lib/at-spi-bus-launcher`, and the resolved path is shell-quoted when embedded into the session's bash wrapper
+- The reason an `InputBackend` (KWin EIS) setup failed was silently swallowed when `session_start`/`session_connect` degraded to "no input backend"/ydotool; the exception text is now logged as a warning before the degradation (backend selection unchanged)
+
+### Internal
+
+- Test cleanups (dead assignment, tautological assert) and type hints on test fakes/helpers
+
 ## [0.8.1] - 2026-09-07
 
 ### Fixed
