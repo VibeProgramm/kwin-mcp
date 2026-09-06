@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Segfault on Python 3.14 caused by missing `argtypes` on variadic `ei_seat_bind_capabilities` ctypes call
+- `accessibility_tree` / `find_ui_elements` returned window-local coordinates instead of true screen coordinates, so clicks computed from them landed on empty desktop while keyboard input kept working. Coordinates are now translated by each window's compositor-side client origin (queried from KWin via a one-shot script, matched by caption, best-effort with fallback to untranslated coordinates)
 
 ## [0.7.0] - 2026-03-29
 
