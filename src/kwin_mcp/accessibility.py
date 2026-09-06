@@ -16,6 +16,12 @@ import gi
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # noqa: E402
 
+from kwin_mcp.kwin_windows import (  # noqa: E402
+    WindowGeometry,
+    get_window_geometries,
+    resolve_offset,
+)
+
 
 @dataclass
 class ElementInfo:
@@ -54,6 +60,7 @@ def get_accessibility_tree(
     lines: list[str] = []
     total = 0
     role_filter = role.lower()
+    geometries = get_window_geometries()
 
     for i in range(desktop.get_child_count()):
         app = desktop.get_child_at_index(i)
@@ -64,7 +71,15 @@ def get_accessibility_tree(
         if app_name and app_name.lower() not in name.lower():
             continue
 
-        count = _format_element(app, lines, depth=0, max_depth=max_depth, role_filter=role_filter)
+        count = _format_element(
+            app,
+            lines,
+            depth=0,
+            max_depth=max_depth,
+            role_filter=role_filter,
+            app_name=name,
+            geometries=geometries,
+        )
         total += count
 
     if not lines:
@@ -93,6 +108,7 @@ def find_elements(
     desktop = Atspi.get_desktop(0)
     results: list[ElementInfo] = []
     query_lower = query.lower()
+    geometries = get_window_geometries()
 
     for i in range(desktop.get_child_count()):
         app = desktop.get_child_at_index(i)
@@ -103,7 +119,16 @@ def find_elements(
         if app_name and app_name.lower() not in name.lower():
             continue
 
-        _search_element(app, query_lower, results, depth=0, max_depth=15, required_states=states)
+        _search_element(
+            app,
+            query_lower,
+            results,
+            depth=0,
+            max_depth=15,
+            required_states=states,
+            app_name=name,
+            geometries=geometries,
+        )
 
     return results
 
@@ -220,16 +245,35 @@ def _format_element(
     depth: int,
     max_depth: int,
     role_filter: str = "",
+    app_name: str = "",
+    geometries: list[WindowGeometry] | None = None,
+    dx: int = 0,
+    dy: int = 0,
 ) -> int:
     """Recursively format an element and its children. Returns element count.
 
     When role_filter is set, only elements with a matching role are displayed,
     but children of non-matching elements are still traversed.
+
+    Coordinates are translated to true screen coordinates: at depth 1 (a
+    top-level window) the offset between the AT-SPI window origin and the
+    compositor-side client origin is resolved and applied to the whole
+    subtree, because Wayland clients report window-local coordinates.
     """
     if depth > max_depth:
         return 0
 
-    info = _extract_info(element, depth)
+    info = _extract_info(element, depth, dx=dx, dy=dy)
+    if depth == 1 and geometries:
+        # Top-level window: resolve the offset between the AT-SPI window
+        # origin (window-local on Wayland) and the compositor-side client
+        # origin, then apply it to this window and its whole subtree.
+        # (dx, dy) are always (0, 0) here since depth 0 passes no offset.
+        ndx, ndy = resolve_offset(geometries, app_name, info.name, info.x, info.y)
+        if ndx or ndy:
+            dx, dy = ndx, ndy
+            info.x += dx
+            info.y += dy
     role_match = not role_filter or role_filter == info.role.lower()
 
     count = 0
@@ -247,7 +291,17 @@ def _format_element(
     for i in range(info.children_count):
         child = element.get_child_at_index(i)
         if child is not None:
-            count += _format_element(child, lines, depth + 1, max_depth, role_filter)
+            count += _format_element(
+                child,
+                lines,
+                depth + 1,
+                max_depth,
+                role_filter,
+                app_name,
+                geometries,
+                dx,
+                dy,
+            )
 
     return count
 
@@ -259,12 +313,26 @@ def _search_element(
     depth: int,
     max_depth: int,
     required_states: list[str] | None = None,
+    app_name: str = "",
+    geometries: list[WindowGeometry] | None = None,
+    dx: int = 0,
+    dy: int = 0,
 ) -> None:
-    """Recursively search for elements matching the query and/or required states."""
+    """Recursively search for elements matching the query and/or required states.
+
+    Coordinates are translated to true screen coordinates (see
+    _format_element for why).
+    """
     if depth > max_depth:
         return
 
-    info = _extract_info(element, depth)
+    info = _extract_info(element, depth, dx=dx, dy=dy)
+    if depth == 1 and geometries:
+        ndx, ndy = resolve_offset(geometries, app_name, info.name, info.x, info.y)
+        if ndx or ndy:
+            dx, dy = ndx, ndy
+            info.x += dx
+            info.y += dy
 
     # Check if element matches query (empty query matches everything)
     query_match = (
@@ -283,11 +351,30 @@ def _search_element(
     for i in range(info.children_count):
         child = element.get_child_at_index(i)
         if child is not None:
-            _search_element(child, query, results, depth + 1, max_depth, required_states)
+            _search_element(
+                child,
+                query,
+                results,
+                depth + 1,
+                max_depth,
+                required_states,
+                app_name,
+                geometries,
+                dx,
+                dy,
+            )
 
 
-def _extract_info(element: Atspi.Accessible, depth: int) -> ElementInfo:
-    """Extract information from an AT-SPI accessible element."""
+def _extract_info(element: Atspi.Accessible, depth: int, dx: int = 0, dy: int = 0) -> ElementInfo:
+    """Extract information from an AT-SPI accessible element.
+
+    Args:
+        element: The accessible element.
+        depth: Depth in the traversed tree.
+        dx: Screen x offset to add (window position correction, see
+            _format_element).
+        dy: Screen y offset to add.
+    """
     role = element.get_role_name() or "unknown"
     name = element.get_name() or ""
     description = element.get_description() or ""
@@ -307,7 +394,7 @@ def _extract_info(element: Atspi.Accessible, depth: int) -> ElementInfo:
         component = element.get_component_iface()
         if component is not None:
             rect = component.get_extents(Atspi.CoordType.SCREEN)
-            x, y, width, height = rect.x, rect.y, rect.width, rect.height
+            x, y, width, height = rect.x + dx, rect.y + dy, rect.width, rect.height
     except Exception:
         pass
 

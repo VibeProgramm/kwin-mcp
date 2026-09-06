@@ -1,6 +1,6 @@
 ---
 name: kwin-desktop-automation
-description: Use when the user asks to launch, click, type, screenshot, or otherwise drive a Linux KDE Plasma / Wayland desktop app through the kwin-mcp MCP server. Trigger when kwin-mcp tools are available and the task involves desktop GUI automation, end-to-end GUI testing, kiosk / embedded device control, or live KDE Plasma session interaction. Teaches session-mode selection (virtual vs live), the observe-act-verify loop, AT-SPI2 vs screenshot tradeoffs, US-QWERTY vs Unicode typing, and platform pitfalls (surface-local coordinates, QMenu invisibility, EIS edge limits, clipboard opt-in).
+description: Use when the user asks to launch, click, type, screenshot, or otherwise drive a Linux KDE Plasma / Wayland desktop app through the kwin-mcp MCP server. Trigger when kwin-mcp tools are available and the task involves desktop GUI automation, end-to-end GUI testing, kiosk / embedded device control, or live KDE Plasma session interaction. Teaches session-mode selection (virtual vs live), the observe-act-verify loop, AT-SPI2 vs screenshot tradeoffs, US-QWERTY vs Unicode typing, and platform pitfalls (coordinate translation, QMenu invisibility, EIS edge limits, clipboard opt-in).
 ---
 
 # kwin-desktop-automation
@@ -74,7 +74,7 @@ These are properties of the Wayland / AT-SPI2 / EIS stack, not bugs. Know them o
 
 - **`keyboard_type` is US QWERTY only.** Non-ASCII text must go through `keyboard_type_unicode`. Always check the input.
 - **Clipboard is opt-in on virtual sessions.** Pass `enable_clipboard=true` to `session_start` AND ensure `wl-clipboard` is installed. Live sessions always have clipboard.
-- **AT-SPI2 coordinates are surface-local on Wayland.** Each app's coordinates are relative to its own window's top-left, not the virtual screen — Wayland clients do not know their global position by design. Single-window scenarios are fine. For multi-window layouts, cross-reference with `screenshot` to disambiguate.
+- **AT-SPI2 coordinates are translated to true screen coordinates.** Wayland clients report window-local coordinates (they do not know their global position by design), so the server offsets each window's widgets by its compositor-side position from KWin. If a window cannot be matched (e.g. KWin scripting unavailable), coordinates may still be window-local — cross-reference with `screenshot` to disambiguate.
 - **QMenu and native context menus may be invisible to AT-SPI2.** Qt's AT-SPI2 bridge has incomplete popup-menu support on Wayland. Workaround: take a `screenshot`, locate the menu item visually, click by coordinates.
 - **Screen edge triggers (auto-hide panels, layer-shell strips) ignore EIS pointer events.** Use `dbus_call` to invoke KWin scripting or a keyboard shortcut instead of trying to hover the edge.
 - **Live sessions inside containers need Wayland + D-Bus mounted in.** Symptom: `session_connect` fails with "no Wayland display" or "no session bus". The user must mount `$XDG_RUNTIME_DIR/wayland-*` and propagate `DBUS_SESSION_BUS_ADDRESS` into the container.
