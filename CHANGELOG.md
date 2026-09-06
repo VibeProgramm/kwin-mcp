@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EIS input injection started emulating before the compositor had resumed the devices, which libei rejects (`device is not emulating`) and which silently dropped every injected event: `_negotiate_devices` now waits for `EI_EVENT_DEVICE_RESUMED` on the pointer and keyboard before `ei_device_start_emulating` and fails with an explicit error if a device never resumes (adopted from upstream isac322/kwin-mcp#42)
 - Segfault on Python 3.14 caused by missing `argtypes` on variadic `ei_seat_bind_capabilities` ctypes call
 - `accessibility_tree` / `find_ui_elements` returned window-local coordinates instead of true screen coordinates, so clicks computed from them landed on empty desktop while keyboard input kept working. Coordinates are now translated by each window's compositor-side client origin (queried from KWin via a one-shot script, matched by caption, best-effort with fallback to untranslated coordinates)
+- The `keyboard_key` ctrl+q alias sent only Ctrl+Shift+Q (Konsole's close-window binding), so apps binding the conventional plain Ctrl+Q (kcalc, kwrite) could never be closed by the alias; it now sends both combos sequentially with a short pause (plain Ctrl+Q first, then Ctrl+Shift+Q) — on apps that bind only one of them the other is an inert no-op shortcut, mirroring the paste-alias pattern
+- `dbus_call` returned D-Bus failures (ServiceUnknown, UnknownMethod, missing `dbus-send` binary) as success-payload strings with `isError=false`, so agents could not tell a failure from a reply; anticipated D-Bus failures now raise ToolError (`isError=true` carrying the message), matching the read_app_log/clipboard error contract
 
 ## [0.8.0] - 2026-09-06
 

@@ -840,9 +840,14 @@ class AutomationEngine:
                 timeout=10,
             )
         except FileNotFoundError:
-            return _INSTALL_HINTS["dbus-send"]
+            # Anticipated failure → ToolError so the client sees the message
+            # (isError=True) instead of a success-payload string (N2).
+            tool_error(_INSTALL_HINTS["dbus-send"])
         if result.returncode != 0:
-            return f"D-Bus call failed: {result.stderr.decode(errors='replace')}"
+            # Anticipated failure (ServiceUnknown, UnknownMethod, ...) →
+            # ToolError (isError=True), matching the read_app_log contract
+            # (N2: these used to be returned as success strings).
+            tool_error(f"D-Bus call failed: {result.stderr.decode(errors='replace')}")
         return result.stdout.decode(errors="replace")
 
     def read_app_log(self, pid: int, last_n_lines: int = 50) -> str:

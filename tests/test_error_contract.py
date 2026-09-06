@@ -86,6 +86,62 @@ def test_clipboard_disabled_raises_tool_error() -> None:
         engine.clipboard_set("text")
 
 
+def _engine_with_fake_session() -> AutomationEngine:
+    """AutomationEngine wired to a fake running session (enough for _session_env)."""
+    engine = AutomationEngine()
+    fake_session = MagicMock()
+    fake_session.is_running = True
+    fake_session.info.dbus_address = "unix:path=/tmp/kwin-mcp-test-dbus"
+    fake_session.info.wayland_socket = "wayland-test-0"
+    fake_session.info.home_dir = None
+    engine._session = fake_session
+    return engine
+
+
+def test_dbus_call_failure_raises_tool_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed dbus-send (ServiceUnknown/UnknownMethod/...) → ToolError with
+    the stderr detail (N2: these used to be success strings, isError=false)."""
+    import kwin_mcp.core as core_module
+
+    class FakeFailure:
+        returncode = 1
+        stderr = b"ServiceUnknown: The name org.not.a.real.service was not provided"
+        stdout = b""
+
+    monkeypatch.setattr(core_module.subprocess, "run", lambda *a, **kw: FakeFailure())
+    engine = _engine_with_fake_session()
+    with pytest.raises(ToolError, match=r"D-Bus call failed.*ServiceUnknown"):
+        engine.dbus_call("org.not.a.real.service", "/", "org.freedesktop.DBus.Peer", "Ping")
+
+
+def test_dbus_call_missing_binary_raises_tool_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing dbus-send binary → ToolError with the install hint (N2)."""
+    import kwin_mcp.core as core_module
+
+    def _missing(*a: object, **kw: object) -> None:
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(core_module.subprocess, "run", _missing)
+    engine = _engine_with_fake_session()
+    with pytest.raises(ToolError, match="dbus-send not found"):
+        engine.dbus_call("org.kde.KWin", "/KWin", "org.kde.KWin", "supportInformation")
+
+
+def test_dbus_call_success_path_stays_a_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Successful replies keep returning the dbus-send stdout unchanged."""
+    import kwin_mcp.core as core_module
+
+    class FakeSuccess:
+        returncode = 0
+        stderr = b""
+        stdout = b'   string   "hello reply"\n'
+
+    monkeypatch.setattr(core_module.subprocess, "run", lambda *a, **kw: FakeSuccess())
+    engine = _engine_with_fake_session()
+    out = engine.dbus_call("org.kde.KWin", "/KWin", "org.kde.KWin", "supportInformation")
+    assert "hello reply" in out
+
+
 def test_server_tool_wrapper_propagates_tool_error() -> None:
     """The MCP tool wrapper lets ToolError through for the SDK to convert
     into isError=True content (the whole point of the H-3/H-4 contract)."""
