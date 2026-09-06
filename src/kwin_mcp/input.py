@@ -893,22 +893,13 @@ class InputBackend:
 
             time.sleep(0.02)
 
-    def keyboard_key(self, key: str) -> None:
-        """Press a key combination (e.g., 'ctrl+c', 'Return', 'alt+F4').
+    def _press_key_combo(self, key: str) -> None:
+        """Press one parsed modifier combo via the bare-keycode path.
 
-        Supports modifier combinations with '+' separator. Bare keys (no
-        modifiers) are routed through the EIS text device when available, so
-        the server resolves them via its own keymap; modifier combos keep the
-        bare-keycode path (which works reliably for shortcuts).
+        This is ``keyboard_key``'s core without the ctrl+q alias dispatch, so
+        the alias can send each combo exactly once without recursing into
+        itself.
         """
-        # Konsole binds its window-close action to Ctrl+Shift+Q (its ACCEL
-        # convention is Ctrl+Shift); plain Ctrl+Q is unbound there, unlike
-        # most KDE apps (kwrite, kcalc) where Ctrl+Q quits. Add the alias so
-        # "quit the focused app" behaves uniformly across KDE apps.
-        if key.lower() in ("ctrl+q", "control+q", "ctrl+quit"):
-            self.keyboard_key("ctrl+shift+q")
-            return
-
         modifiers, keycode = _parse_key_combo(key)
         if keycode is None:
             return
@@ -938,6 +929,29 @@ class InputBackend:
         for mod in reversed(modifiers):
             time.sleep(0.01)
             self._client.keyboard_key(mod, _RELEASED)
+
+    def keyboard_key(self, key: str) -> None:
+        """Press a key combination (e.g., 'ctrl+c', 'Return', 'alt+F4').
+
+        Supports modifier combinations with '+' separator. Bare keys (no
+        modifiers) are routed through the EIS text device when available, so
+        the server resolves them via its own keymap; modifier combos keep the
+        bare-keycode path (which works reliably for shortcuts).
+        """
+        # KDE splits window-close across two bindings by ACCEL convention:
+        # Konsole binds it to Ctrl+Shift+Q (its ACCEL convention is
+        # Ctrl+Shift), while most other KDE apps (kwrite, kcalc) bind plain
+        # Ctrl+Q — each combo is unbound in the other apps. Send both with a
+        # short pause (mirroring the paste alias below); on apps that bind
+        # only one of them the other is an inert no-op shortcut, so "quit the
+        # focused app" behaves uniformly across KDE apps.
+        if key.lower() in ("ctrl+q", "control+q", "ctrl+quit"):
+            self._press_key_combo("ctrl+q")
+            time.sleep(0.15)
+            self._press_key_combo("ctrl+shift+q")
+            return
+
+        self._press_key_combo(key)
 
     def keyboard_key_down(self, key: str) -> None:
         """Press (and hold) a key combination without releasing.

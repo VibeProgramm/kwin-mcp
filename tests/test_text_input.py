@@ -151,16 +151,37 @@ def test_keyboard_key_combo_keeps_keycode_path() -> None:
     assert codes == [29, 45, 45, 29]  # ctrl down, x down, x up, ctrl up
 
 
-def test_keyboard_key_ctrl_q_adds_konsole_shift_alias() -> None:
-    """Plain Ctrl+Q also sends Ctrl+Shift+Q: Konsole >= 21 binds close-window
-    to Ctrl+Shift+Q (its ACCEL convention is Ctrl+Shift) and ignores plain
-    Ctrl+Q, while other KDE apps (kwrite, kcalc) quit on plain Ctrl+Q.
-    Sending both closes whichever of the two is focused."""
+def test_keyboard_key_ctrl_q_sends_both_bindings() -> None:
+    """Ctrl+Q sends BOTH bindings: plain Ctrl+Q (bound in most KDE apps —
+    kwrite, kcalc — but unbound in Konsole) and Ctrl+Shift+Q (Konsole's
+    close-window binding, its ACCEL convention is Ctrl+Shift). Sending only
+    one closed just whichever app bound it (N1); on apps that bind the other
+    combo it is an inert no-op shortcut."""
     backend, client = _backend_with_text_device()
     backend.keyboard_key("ctrl+q")
     client.text_keysym.assert_not_called()
     codes = [c.args[0] for c in client.keyboard_key.call_args_list]
-    # ctrl(29) shift(42) q(16) down/up each
+    # First combo: ctrl(29) q(16) down/up. Second combo: ctrl(29) shift(42)
+    # q(16) down/up. No recursion, each combo sent exactly once.
+    assert codes == [29, 16, 16, 29, 29, 42, 16, 16, 42, 29]
+
+
+def test_keyboard_key_ctrl_q_alias_variants_send_both_bindings() -> None:
+    """All ctrl+q alias spellings go through the dual-binding dispatch."""
+    for spelling in ("control+q", "ctrl+quit"):
+        backend, client = _backend_with_text_device()
+        backend.keyboard_key(spelling)
+        client.text_keysym.assert_not_called()
+        codes = [c.args[0] for c in client.keyboard_key.call_args_list]
+        assert codes == [29, 16, 16, 29, 29, 42, 16, 16, 42, 29]
+
+
+def test_keyboard_key_plain_ctrl_shift_q_is_not_duplicated() -> None:
+    """An explicit ctrl+shift+q request must not trigger the alias dispatch:
+    the keycode path sends exactly one ctrl+shift+q combo."""
+    backend, client = _backend_with_text_device()
+    backend.keyboard_key("ctrl+shift+q")
+    codes = [c.args[0] for c in client.keyboard_key.call_args_list]
     assert codes == [29, 42, 16, 16, 42, 29]
 
 
