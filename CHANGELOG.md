@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `session_start` could hang forever when the KWin wrapper never printed `READY` (dead KWin, missing binaries) or waited forever for the Wayland socket: the parent now reads the wrapper's stdout with a 25s deadline, and the wrapper's socket wait is bounded (150 x 0.1s = 15s, reports `NOSOCKET` and exits 1). Startup failures now include KWin's stderr, and `launch_app` no longer leaks the host `DISPLAY` into isolated sessions, where X11 applications would silently open on the user's real desktop (adopted from upstream isac322/kwin-mcp#50)
+- EIS input injection started emulating before the compositor had resumed the devices, which libei rejects (`device is not emulating`) and which silently dropped every injected event: `_negotiate_devices` now waits for `EI_EVENT_DEVICE_RESUMED` on the pointer and keyboard before `ei_device_start_emulating` and fails with an explicit error if a device never resumes (adopted from upstream isac322/kwin-mcp#42)
 - Segfault on Python 3.14 caused by missing `argtypes` on variadic `ei_seat_bind_capabilities` ctypes call
 - `accessibility_tree` / `find_ui_elements` returned window-local coordinates instead of true screen coordinates, so clicks computed from them landed on empty desktop while keyboard input kept working. Coordinates are now translated by each window's compositor-side client origin (queried from KWin via a one-shot script, matched by caption, best-effort with fallback to untranslated coordinates)
 
