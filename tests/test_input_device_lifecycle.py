@@ -460,7 +460,11 @@ def test_ensure_devices_ready_reconnects_after_unresumed_pause(monkeypatch) -> N
     """
     fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
-    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    # Issue #235: the pre-reconnect stall wait is 0.5s now (was 5s), so the
+    # clock step must stay below that budget for the wait loop to actually
+    # run and observe the queued pause — the test's semantics are unchanged,
+    # only the modelled timing constant moved.
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.05))
     client = _client(fake)
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
@@ -537,8 +541,9 @@ def test_ensure_devices_ready_reconnect_failure_raises_tool_error(monkeypatch) -
     monkeypatch.setattr(input_module, "_get_libei", lambda: router)
     monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
     monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
-    # Fast-forward the readiness wait and the 5s negotiation deadline.
-    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    # Fast-forward the readiness wait and the 5s negotiation deadline (step
+    # below the 0.5s stall-wait budget, issue #235, so the wait loop runs).
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.05))
 
     client = _client(stale)
     client._emulating_devices = set()
@@ -634,7 +639,10 @@ def test_paused_after_send_is_not_tool_error(monkeypatch) -> None:
     """
     fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
-    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    # Issue #235: stall wait shortened to 0.5s — the clock step must stay
+    # below it for the wait loop to run and drain the queued pause
+    # (semantics unchanged, modelled timing constant moved).
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.05))
     client = _client(fake)
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
@@ -1088,7 +1096,10 @@ def test_second_ensure_after_failed_reconnect_is_clean_tool_error(monkeypatch) -
     with pytest.raises(ToolError, match="EIS reconnect failed"):
         client._ensure_devices_ready(timeout_s=0.05)
     assert client._ei == 0
-    # Exactly one reconnect attempt per ensure call (fresh handshake twice).
+    # Exactly one reconnect attempt per ensure call (fresh handshake twice):
+    # a reconnect that raises inside _setup aborts the retry loop of issue
+    # #235 immediately — retrying a hard-failing handshake adds only
+    # latency, the error is already honest and complete.
     assert fresh.setup_fds == [11, 11]
 
 
@@ -1436,8 +1447,9 @@ def _reconnect_text_path_setup(
     Pointer + keyboard work, the stale text device is paused (so the very
     first text injection stalls and takes the reconnect path), and the real
     ``_setup``/``_negotiate_devices`` runs against the fresh connection's
-    fake. The clock is fast-forwarded so the 5s stall wait and negotiation
-    deadlines burn no wall time.
+    fake. The clock is fast-forwarded so the stall wait and negotiation
+    deadlines burn no wall time (issue #235: the stall wait is 0.5s now, the
+    step stays below it so the wait loop actually runs).
     """
     stale = FakeLibei(
         [],
@@ -1447,7 +1459,7 @@ def _reconnect_text_path_setup(
     monkeypatch.setattr(input_module, "_get_libei", lambda: router)
     monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
     monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
-    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.05))
 
     client = _client(stale)
     client._text_device = TEXT_DEV  # stale text device, currently paused
@@ -1468,7 +1480,7 @@ def _reconnect_touch_path_setup(
     monkeypatch.setattr(input_module, "_get_libei", lambda: router)
     monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
     monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
-    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.05))
 
     client = _client(stale)
     client._touch_device = TOUCH  # stale touch device, currently paused
@@ -1845,3 +1857,177 @@ def test_held_key_release_after_recovery_does_not_double_release(monkeypatch) ->
     backend.keyboard_key_up("shift")
     assert fake.key_calls[-1] == (42, _RELEASED)
     assert client._held_keys == set()
+
+
+# ── Issue #235: bounded reconnect retry loop for KWin's pause cycle ────────
+#
+# Live pattern (ei-debug log): KWin pauses its EIS devices right after every
+# handshake — ADDED+RESUMED x3 then PAUSED x2, the fresh connection lives less
+# than a second, and the cycle repeats. A single reconnect + one re-check
+# window (the #228 shape) cannot win against that: the gate now retries the
+# reconnect a bounded number of times, each attempt getting one short
+# re-check, and fails loudly with the attempt count when the budget is
+# exhausted. The pre-reconnect stall wait is shortened accordingly (0.5s,
+# was 5s): a PAUSED stall without a RESUMED leads into a reconnect anyway,
+# so waiting longer only burns latency (wingman #231).
+
+
+def _pause_cycle_setup(
+    monkeypatch: Any,
+    fresh_count: int,
+    pause_cycles: int,
+) -> tuple[EISClient, FakeLibei, list[FakeLibei]]:
+    """A stalled client + fresh fakes modelling KWin's pause cycle (#235).
+
+    Returns ``(client, stale, fresh)``: the client starts on the stale
+    connection with paused devices and no resume queued; reconnect attempt N
+    is handed fresh fake N (SwitchingLibei, contexts 101, 102, ...). The
+    first ``pause_cycles`` fresh connections re-pause pointer + keyboard
+    right after their handshake completes (LateEventFakeLibei with
+    ``late_after_drains=1``: the pause lands in the queue after the
+    handshake's last drain, so the negotiation itself succeeds and the
+    post-reconnect wait observes the pause — exactly the live pattern); the
+    remaining fakes keep their devices emulating.
+    """
+    stale = FakeLibei(
+        [],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    handshake = [
+        (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+        (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+        (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+        (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+    ]
+    caps = {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}}
+    fresh: list[FakeLibei] = []
+    for index in range(fresh_count):
+        if index < pause_cycles:
+            fresh.append(
+                LateEventFakeLibei(
+                    list(handshake),
+                    dict(caps),
+                    late_events=[
+                        (_EI_EVENT_DEVICE_PAUSED, NEW_POINTER),
+                        (_EI_EVENT_DEVICE_PAUSED, NEW_KEYBOARD),
+                    ],
+                    late_caps={},
+                    late_after_drains=1,
+                )
+            )
+        else:
+            fresh.append(FakeLibei(list(handshake), dict(caps)))
+    router = SwitchingLibei([stale, *fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+    # Small step so the (shortened) stall and post-reconnect wait loops
+    # actually run and observe the queued pauses.
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.05))
+
+    client = _client(stale)
+    client._emulating_devices = set()  # paused without resume → stall
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
+    return client, stale, fresh
+
+
+def test_pause_cycle_delivers_after_bounded_reconnect_attempts(monkeypatch: Any) -> None:
+    """(a) Pause cycle → bounded reconnect attempts → delivery on the 3rd.
+
+    Attempts 1-2 land on fresh connections that re-pause their devices right
+    after the handshake; the 3rd fresh connection keeps them emulating, the
+    post-reconnect re-check succeeds and the injection is delivered — no
+    ToolError, exactly three reconnects.
+    """
+    client, stale, fresh = _pause_cycle_setup(monkeypatch, fresh_count=3, pause_cycles=2)
+
+    client.keyboard_key(30, _PRESSED)
+
+    # Exactly three rebuilds: the stale connection and both pause-cycled
+    # fresh ones were released; the third fresh connection is still alive.
+    assert stale.unrefed_ei == [1]
+    assert fresh[0].unrefed_ei == [101]
+    assert fresh[1].unrefed_ei == [102]
+    assert fresh[2].unrefed_ei == []
+    # The injection landed on the third (still-emulating) connection.
+    assert client._keyboard == NEW_KEYBOARD
+    assert fresh[2].key_calls == [(30, _PRESSED)]
+    assert fresh[2].frames == [NEW_KEYBOARD]
+
+
+def test_pause_cycle_exhausts_attempts_into_clean_tool_error(monkeypatch: Any) -> None:
+    """(b) Every attempt re-paused → ToolError with the attempt budget.
+
+    After the bounded budget the injection fails loudly (the attempt count
+    is in the message) and the connection is torn down, so the next call
+    starts its reconnect from a clean slate — and nothing was ever sent
+    into a paused device.
+    """
+    client, stale, fresh = _pause_cycle_setup(monkeypatch, fresh_count=3, pause_cycles=3)
+
+    with pytest.raises(ToolError, match="after 3 reconnect attempts"):
+        client.keyboard_key(30, _PRESSED)
+
+    # All three fresh connections were built and released again; the stale
+    # one went first.
+    assert stale.unrefed_ei == [1]
+    assert [f.unrefed_ei for f in fresh] == [[101], [102], [103]]
+    # Clean slate: the next call starts its reconnect from scratch (F1).
+    assert client._ei == 0
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    assert client._emulating_devices == set()
+    # No injection was sent into a paused device.
+    assert all(f.key_calls == [] for f in fresh)
+
+
+def test_ensure_devices_ready_first_stall_wait_is_half_second(monkeypatch: Any) -> None:
+    """(c) The pre-reconnect stall wait is 0.5s, not the old 5s (#231/#235).
+
+    In the pause cycle the devices never resume on their own, so a long
+    stall wait only burns latency before the reconnect that is needed
+    anyway. FakeClock advances 0.1s per monotonic() call: the reconnect must
+    fire within ~1.5s of fake time — the old 5s deadline landed at ~5.5s.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.1))
+    client = _client(fake)
+    client._emulating_devices = set()  # paused, no resume queued → stall
+
+    reconnect_at: list[float] = []
+
+    def fake_setup() -> None:
+        reconnect_at.append(input_module.time.monotonic())
+        client._ei = 101
+        client._pointer = NEW_POINTER
+        client._keyboard = NEW_KEYBOARD
+        client._emulating_devices = {NEW_POINTER, NEW_KEYBOARD}
+
+    client._setup = fake_setup  # ty: ignore[invalid-assignment]
+
+    client._ensure_devices_ready()
+
+    assert len(reconnect_at) == 1
+    assert reconnect_at[0] <= 1.5  # old deadline: ~5.5 fake seconds
+    # The policy constant itself (the behavioral assert above is primary).
+    assert input_module._STALL_READY_TIMEOUT_S == 0.5
+
+
+def test_ensure_devices_ready_happy_path_no_reconnect(monkeypatch: Any) -> None:
+    """(d) Emulating devices → zero reconnects, immediate delivery.
+
+    The bounded retry loop must never touch a healthy connection: the first
+    readiness probe short-circuits before any reconnect logic runs.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)  # pointer + keyboard already emulating
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
+
+    client.keyboard_key(30, _PRESSED)
+
+    assert setup_calls == []
+    assert fake.key_calls == [(30, _PRESSED)]
+    assert fake.frames == [KEYBOARD]
+    assert client._pointer == POINTER  # same, untouched connection

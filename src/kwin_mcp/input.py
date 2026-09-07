@@ -160,11 +160,37 @@ _EI_EVENT_DEVICE_PAUSED = 9
 # Scroll axis values (in libei, scroll is in pixels)
 _SCROLL_STEP_PIXELS = 15.0
 
-# Post-reconnect re-check window for extra required device slots (text/touch).
-# A fresh handshake only guarantees pointer + keyboard; a required extra slot
-# gets this much time to reach RESUMED before the injection fails loudly
-# instead of being silently dropped into a paused device (wingman #228).
-_POST_RECONNECT_READY_TIMEOUT_S = 2.0
+# Pre-reconnect stall wait (wingman #231, #235): a PAUSED stall without a
+# RESUMED leads into a reconnect anyway, so waiting longer before it only
+# burns latency in KWin's pause cycle (handshake → resume → pause, the fresh
+# connection lives under a second). 0.5s still catches an ordinary late
+# resume without turning every transient pause into a reconnect.
+_STALL_READY_TIMEOUT_S = 0.5
+
+# Post-reconnect bounded retry loop (wingman #235): KWin may pause its EIS
+# devices right after EVERY handshake (the fresh connection lives under a
+# second, then the cycle repeats), so a single reconnect + re-check (the
+# #228 shape) loses against the cycle. The gate now retries the reconnect a
+# bounded number of times, each attempt getting one short re-check window;
+# when the budget is exhausted the injection fails loudly with the attempt
+# count instead of being silently dropped into a paused device.
+#
+# Budget: 3 attempts x (fresh handshake <=5s + 0.5s re-check) keeps the worst
+# case at ~3-4s of controllable wait per call in the live cycle (each
+# handshake there completes in well under the 5s negotiation deadline) and
+# each attempt resolves in hundreds of milliseconds. A reconnect that RAISES
+# (D-Bus/libei/handshake error) still aborts immediately — retrying a hard
+# failure adds only latency, the error is already honest (#229/F1 keep the
+# state clean for the next call).
+_RECONNECT_ATTEMPTS = 3
+
+# Post-reconnect re-check window for extra required device slots (text/touch)
+# and for the fresh handshake's devices in general (#235 retry loop): a
+# fresh handshake only guarantees pointer + keyboard reaching the READY
+# state; a required extra slot gets this much time per attempt to reach
+# RESUMED before the attempt is judged failed and the loop continues
+# (wingman #228, #235).
+_POST_RECONNECT_READY_TIMEOUT_S = 0.5
 
 # Slot attributes holding the negotiated EIS device handles. The tuple
 # travels together wherever devices are dropped or released, so it lives in
@@ -843,7 +869,7 @@ class EISClient:
         return int(time.monotonic() * 1_000_000)
 
     def _ensure_devices_ready(
-        self, timeout_s: float = 5.0, require_attrs: tuple[str, ...] = ()
+        self, timeout_s: float = _STALL_READY_TIMEOUT_S, require_attrs: tuple[str, ...] = ()
     ) -> None:
         """Wait until pointer + keyboard are emulating, reconnecting on failure.
 
@@ -869,35 +895,53 @@ class EISClient:
         reconnect guarantees emulating devices, because ``_setup`` runs the
         device negotiation itself and raises on failure.
 
-        After a successful reconnect the requested ``require_attrs`` slots are
-        re-checked against the FRESH connection (bounded re-wait, issue #228):
-        the fresh handshake only guarantees pointer + keyboard, so a text /
-        touch slot may come back paused or unadvertised. If the re-check
-        fails, a clean ToolError stops the injection — a silent drop into a
-        paused or NULL device is exactly what this gate exists to prevent.
+        Wingman #235: KWin may pause its devices right after EVERY fresh
+        handshake (the pause cycle — the fresh connection lives under a
+        second, then the cycle repeats), so a single reconnect + re-check
+        (issue #228 shape) loses against the cycle. The reconnect is
+        therefore retried a bounded number of times (``_RECONNECT_ATTEMPTS``),
+        each attempt getting one ``_POST_RECONNECT_READY_TIMEOUT_S`` re-check
+        window; exhausting the budget tears the connection down and fails
+        loudly with the attempt count. A reconnect that raises inside
+        ``_setup`` (D-Bus/libei/handshake error) still aborts immediately:
+        the state is already clean (#229) and retrying a hard failure only
+        adds latency. The pre-reconnect stall wait was shortened to
+        ``_STALL_READY_TIMEOUT_S`` accordingly.
+
+        After each successful reconnect the requested ``require_attrs`` slots
+        are re-checked against the FRESH connection (bounded re-wait, issue
+        #228): the fresh handshake only guarantees pointer + keyboard, so a
+        text / touch slot may come back paused or unadvertised — such an
+        attempt counts as failed and the loop continues. A clean ToolError
+        stops the injection after the budget — a silent drop into a paused
+        or NULL device is exactly what this gate exists to prevent.
         (A failed reconnect raises inside ``_reconnect`` and never reaches
         the re-check.)
         """
         if self._wait_emulating(timeout_s, require_attrs):
             return
-        _ei_debug("devices stalled; reconnecting EIS")
-        try:
-            self._reconnect()
-        except (ToolError, RuntimeError) as exc:
-            tool_error(f"EIS reconnect failed: {exc}")
-        if not self._wait_emulating(_POST_RECONNECT_READY_TIMEOUT_S, require_attrs):
-            self._teardown_connection()
-            missing = ", ".join(
-                attr.removeprefix("_")
-                for attr in require_attrs
-                if not self._device_emulating(getattr(self, attr))
+        for attempt in range(1, _RECONNECT_ATTEMPTS + 1):
+            _ei_debug(
+                f"devices stalled; reconnecting EIS (attempt {attempt}/{_RECONNECT_ATTEMPTS})"
             )
-            tool_error(
-                "EIS reconnect did not restore the requested input devices "
-                f"({missing or 'pointer/keyboard'}) within "
-                f"{_POST_RECONNECT_READY_TIMEOUT_S:.0f}s; injection aborted "
-                "instead of being silently dropped into a paused device."
-            )
+            try:
+                self._reconnect()
+            except (ToolError, RuntimeError) as exc:
+                tool_error(f"EIS reconnect failed: {exc}")
+            if self._wait_emulating(_POST_RECONNECT_READY_TIMEOUT_S, require_attrs):
+                return
+        self._teardown_connection()
+        missing = ", ".join(
+            attr.removeprefix("_")
+            for attr in require_attrs
+            if not self._device_emulating(getattr(self, attr))
+        )
+        tool_error(
+            f"EIS did not restore the requested input devices "
+            f"({missing or 'pointer/keyboard'}) after {_RECONNECT_ATTEMPTS} "
+            "reconnect attempts; injection aborted instead of being silently "
+            "dropped into a paused device."
+        )
 
     def _wait_emulating(self, timeout_s: float, require_attrs: tuple[str, ...] = ()) -> bool:
         """Wait until pointer + keyboard (+ extra slots) emulate, draining events.
