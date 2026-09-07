@@ -1503,9 +1503,19 @@ class EISClient:
         self._flush()
 
     def touch_down(self, x: float, y: float) -> int:
-        """Start a new touch at (x, y). Returns a touch ID."""
+        """Start a new touch at (x, y). Returns a touch ID.
+
+        Requires a negotiated EIS touch device: the touch is created on it
+        directly (issue #24). The old pointer fallback created a touch
+        object on a device without touchscreen capability — libei resolves
+        that to a NULL touchscreen, a wire error that ends in
+        ``ei_disconnect`` — so a touch-less connection now fails cleanly
+        with a ToolError instead of killing the connection.
+        """
         self._ensure_devices_ready(require_attrs=("_touch_device",))
-        device = self._touch_device or self._pointer
+        if self._touch_device == 0:
+            tool_error("No EIS touch device on this connection")
+        device = self._touch_device
         touch = _get_libei().ei_device_touch_new(device)
         if not touch:
             msg = "Failed to create touch object"
@@ -1547,9 +1557,13 @@ class EISClient:
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
             raise ValueError(msg)
-        device = self._touch_device or self._pointer
+        if self._touch_device == 0:
+            # Mirror touch_down: a reconnect during the gesture could leave
+            # the fresh connection without a touch device — never send the
+            # motion into a non-touchscreen device (wire error → ei_disconnect).
+            tool_error("No EIS touch device on this connection")
         _get_libei().ei_touch_motion(touch, x, y)
-        _get_libei().ei_device_frame(device, self._now_us())
+        _get_libei().ei_device_frame(self._touch_device, self._now_us())
         self._flush()
 
     def touch_up(self, touch_id: int) -> None:
@@ -1567,9 +1581,14 @@ class EISClient:
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
             raise ValueError(msg)
-        device = self._touch_device or self._pointer
+        if self._touch_device == 0:
+            # Mirror touch_down: the gesture is already popped (finished
+            # client-side) — no device event is sent into a non-touchscreen
+            # device (wire error → ei_disconnect), only the object release.
+            _get_libei().ei_touch_unref(touch)
+            tool_error("No EIS touch device on this connection")
         _get_libei().ei_touch_up(touch)
-        _get_libei().ei_device_frame(device, self._now_us())
+        _get_libei().ei_device_frame(self._touch_device, self._now_us())
         _get_libei().ei_touch_unref(touch)
         self._flush()
 

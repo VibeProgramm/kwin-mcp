@@ -716,6 +716,8 @@ def test_touch_down_unrefs_touch_on_delivery_failure(monkeypatch) -> None:
     fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
     client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices.add(TOUCH)
 
     with pytest.raises(ToolError, match="input delivery failed"):
         client.touch_down(5.0, 5.0)
@@ -844,7 +846,11 @@ def test_reconnect_releases_active_touches(monkeypatch) -> None:
     with pytest.raises(ValueError, match="No active touch"):
         client.touch_move(5, 1.0, 1.0)
 
-    # Fresh gestures work again from ID 0 on the new connection.
+    # Fresh gestures work again from ID 0 on the new connection (the fresh
+    # connection carries a touch device — the pointer fallback is gone,
+    # issue #24).
+    client._touch_device = TOUCH
+    client._emulating_devices.add(TOUCH)
     touch_id = client.touch_down(10.0, 20.0)
     assert touch_id == 0
     client.touch_move(touch_id, 11.0, 21.0)
@@ -1159,8 +1165,13 @@ def test_second_ensure_after_failed_reconnect_is_clean_tool_error(monkeypatch) -
 
 
 def _touch_client(fake: FakeLibei, touch_id: int = 0, pointer: int = 0x777) -> EISClient:
-    """A stalled client holding one active touch gesture."""
+    """A stalled client holding one active touch gesture on a touch device.
+
+    The touch slot is negotiated (TOUCH = 0x103) per the issue #24 contract:
+    touch tools require a touchscreen device — the pointer fallback is gone.
+    """
     client = _client(fake)
+    client._touch_device = TOUCH
     client._emulating_devices = set()  # paused without resume → stall
     client._active_touches = {touch_id: pointer}
     client._next_touch_id = touch_id + 1
@@ -1222,7 +1233,11 @@ def test_touch_move_with_successful_recovery_uses_live_pointer(monkeypatch) -> N
     """A gesture ID stays valid when the readiness check recovers without a
     reconnect: the dict entry was never invalidated."""
     fake = FakeLibei(
-        [(_EI_EVENT_DEVICE_RESUMED, POINTER), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+        [
+            (_EI_EVENT_DEVICE_RESUMED, POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, TOUCH),
+        ],
         {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
     )
     _install(monkeypatch, fake)
@@ -1232,6 +1247,69 @@ def test_touch_move_with_successful_recovery_uses_live_pointer(monkeypatch) -> N
 
     assert fake.touch_motions == [(0x777, 1.0, 2.0)]
     assert client._active_touches == {0: 0x777}  # gesture continues
+
+
+# ── Issue #24: no pointer fallback for touch tools ─────────────────────────
+
+
+def test_touch_down_without_touch_device_raises_clean_tool_error(monkeypatch) -> None:
+    """Touch on a touch-less connection → clean ToolError, connection alive.
+
+    The old pointer fallback created the touch object on a device without
+    touchscreen capability — libei resolves that to a NULL touchscreen and
+    the wire error ends in ``ei_disconnect``. Now the injection aborts with
+    a ToolError and the connection survives (the next keyboard call works).
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)  # _touch_device == 0, pointer emulating
+
+    with pytest.raises(ToolError, match="No EIS touch device on this connection"):
+        client.touch_down(5.0, 5.0)
+
+    # No gesture object was ever created (no device to create it on).
+    assert fake.touch_downs == []
+    assert client._active_touches == {}
+    assert client._connection_dead is False
+
+    # The connection survived: the next keyboard injection still works.
+    client.keyboard_key(30, _PRESSED)
+    assert fake.key_calls == [(30, _PRESSED)]
+
+
+def test_touch_move_without_touch_device_raises_clean_tool_error(monkeypatch) -> None:
+    """touch_move on a fresh connection without a touch device fails cleanly."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _touch_client(fake)
+    client._touch_device = 0
+    client._emulating_devices = {POINTER, KEYBOARD}  # gate passes on pointer+kbd
+
+    with pytest.raises(ToolError, match="No EIS touch device on this connection"):
+        client.touch_move(0, 1.0, 1.0)
+
+    # The gesture object survives the failed call (untouched bookkeeping).
+    assert client._active_touches == {0: 0x777}
+    assert client._connection_dead is False
+
+
+def test_touch_up_without_touch_device_raises_clean_tool_error(monkeypatch) -> None:
+    """touch_up without a touch device releases the gesture, fails cleanly."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _touch_client(fake)
+    client._touch_device = 0
+    client._emulating_devices = {POINTER, KEYBOARD}
+
+    with pytest.raises(ToolError, match="No EIS touch device on this connection"):
+        client.touch_up(0)
+
+    # The gesture is finished client-side (popped + unref'd) but no device
+    # event was sent into the non-touchscreen device.
+    assert client._active_touches == {}
+    assert fake.touch_ups == []
+    assert fake.unrefed_touches == [0x777]
+    assert client._connection_dead is False
 
 
 # ── F3: _reconnect must reuse _teardown_connection (full, resilient) ──────
