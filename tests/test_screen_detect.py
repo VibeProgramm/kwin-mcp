@@ -174,6 +174,36 @@ def test_detect_kscreen_doctor_bbox_is_union_not_last_monitor(monkeypatch) -> No
     assert _detect_physical_screen_size() == (5760, 1440)
 
 
+def test_detect_kscreen_doctor_union_with_negative_offset(monkeypatch) -> None:
+    """An output left of the origin (negative Geometry X) widens the union.
+
+    xrandr counterpart: test_detect_xrandr_union_with_negative_offset.
+    kscreen-doctor prints ``Geometry: -1920,0 1920x1080`` for a monitor
+    positioned left of the primary; the parser accepts negative coordinates
+    and the union spans from the leftmost to the rightmost edge — on
+    ``-1920,0 1920x1080`` + ``0,0 2560x1440`` that is 4480x1440, not the
+    2560x1440 of the origin-anchored output alone.
+    """
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1 enabled\n"
+            "priority 2\n"
+            "Geometry: -1920,0 1920x1080\n"
+            "Output: 2 DP-2 enabled\n"
+            "priority 1\n"
+            "Geometry: 0,0 2560x1440\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (4480, 1440)
+
+
 def test_detect_kscreen_doctor_mirrored_outputs_collapse(monkeypatch) -> None:
     """Mirrored outputs with identical geometry collapse into one region.
 
@@ -341,6 +371,31 @@ def test_detect_xrandr_union_with_negative_offset(monkeypatch) -> None:
             "Screen 0: minimum 320 x 200, current 3840 x 1080, maximum 32767 x 32767\n"
             "DP-1 connected primary 1920x1080+0+0 (normal left inverted right) 509mm x 286mm\n"
             "DP-2 connected 1920x1080+-1920+0 (normal left inverted right) 509mm x 286mm\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (3840, 1080)
+
+
+def test_detect_xrandr_union_beats_overscanned_screen_current(monkeypatch) -> None:
+    """``Screen current`` is only a fallback — the monitors' union wins.
+
+    Guards the "current beats union" mutant of F3: in every other xrandr
+    fixture the framebuffer size equals the monitors' union, so a parser
+    that preferred ``Screen current W x H`` would pass the suite. Here the
+    framebuffer is wider than the connected monitors (e.g. overscan leaves
+    stale space), so union 3840x1080 and ``Screen current 4096 x 1080``
+    differ, and the union must be reported.
+    """
+    monkeypatch.setattr(
+        core_module.shutil, "which", _which(monkeypatch, {"xrandr": "/usr/bin/xrandr"})
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Screen 0: minimum 320 x 200, current 4096 x 1080, maximum 32767 x 32767\n"
+            "DP-1 connected primary 1920x1080+0+0 (normal left inverted right) 509mm x 286mm\n"
+            "DP-2 connected 1920x1080+1920+0 (normal left inverted right) 509mm x 286mm\n"
         ),
     )
     assert _detect_physical_screen_size() == (3840, 1080)
