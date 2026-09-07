@@ -428,10 +428,12 @@ class EISClient:
             raise RuntimeError(msg) from exc
 
         fd = result[0].take()
-        self._cookie = int(result[1])
 
         fd_seen_by_libei = False
         try:
+            # Inside the guard: if int() ever raised, the except path below
+            # would close the not-yet-seen fd instead of leaking it (#229).
+            self._cookie = int(result[1])
             # Create libei sender context
             self._ei = _get_libei().ei_new_sender(None)
             if not self._ei:
