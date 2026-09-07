@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The MCP `serverInfo` now carries the installed package version (previously an empty string)
 - `_flush` on a released EIS context (`_ei == 0`) now raises a clean ToolError instead of returning silently: the old path reported success for an injection that never reached libei, against the honest-delivery contract
 - The inbound event drain now stops after a DISCONNECT event: events still queued behind it (e.g. a RESUMED) belong to the dead connection and no longer trigger `start_emulating` or held-state replay on it; a handshake interrupted by DISCONNECT/dispatch failure now fails instead of reporting success on stale device handles
-- The EIS reconnect retry loop is additionally bounded by a `_RECONNECT_WALL_BUDGET_S` (4s) wall-clock deadline measured from the readiness-gate entry: the attempt count alone did not bound one call (a wedged handshake can sit out its 5s deadline per attempt). The exhaustion ToolError names the attempts actually made. Honest worst case per call is now ~10s (stall wait + budget + one in-flight handshake + re-check); in the live cycle (fast handshakes) recovery still lands in ~3-4s
+- The EIS reconnect retry loop is additionally bounded by a `_RECONNECT_RETRY_BUDGET_S` (4s) wall-clock deadline measured from the readiness-gate entry: the attempt count alone did not bound one call (a wedged handshake can sit out its 5s deadline per attempt). The exhaustion ToolError names the attempts actually made. Honest worst case per call is now ~10s (stall wait + budget + one in-flight handshake + re-check); in the live cycle (fast handshakes) recovery still lands in ~3-4s
 
 ## [0.8.2] - 2026-09-07
 

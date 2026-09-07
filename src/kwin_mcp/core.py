@@ -53,6 +53,10 @@ def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
     single monitor (F3). Mirrored outputs with identical geometry naturally
     collapse into the same rectangle. Sizes are the visible (logical, already
     scaled by the compositor) desktop dimensions.
+
+    Some kscreen-doctor versions compact the flags and the geometry onto the
+    "Output:" line itself, so the Geometry match is searched per line
+    instead of requiring a line that starts with "Geometry:".
     """
     boxes: list[tuple[int, int, int, int]] = []  # (x, y, w, h) per enabled output
     enabled = False
@@ -61,6 +65,18 @@ def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
     def finish_block() -> None:
         if enabled and geometry is not None:
             boxes.append(geometry)
+
+    def parse_geometry(line: str) -> tuple[int, int, int, int] | None:
+        """Extract the ``x,y WxH`` geometry from any line holding one."""
+        match = re.search(r"(-?\d+),\s*(-?\d+)\s+(\d+)x(\d+)", line)
+        if match:
+            return (
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4)),
+            )
+        return None
 
     for raw_line in output.splitlines():
         line = _strip_ansi(raw_line).strip()
@@ -78,15 +94,19 @@ def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
                 enabled = True
             elif "disabled" in tokens:
                 enabled = False
-        elif line.startswith("Geometry:"):
-            match = re.search(r"(-?\d+),\s*(-?\d+)\s+(\d+)x(\d+)", line)
-            if match:
-                geometry = (
-                    int(match.group(1)),
-                    int(match.group(2)),
-                    int(match.group(3)),
-                    int(match.group(4)),
-                )
+            # The same compact form may also carry the Geometry on this
+            # line ("... priority 1 Geometry: 0,0 1920x1080"), so every
+            # line is searched for a geometry, not just Geometry:-led ones.
+            # A Geometry marker without parseable numbers leaves any earlier
+            # geometry of the block untouched, as before.
+            if "Geometry:" in rest:
+                parsed = parse_geometry(rest)
+                if parsed is not None:
+                    geometry = parsed
+        elif "Geometry:" in line:
+            parsed = parse_geometry(line)
+            if parsed is not None:
+                geometry = parsed
         else:
             # Generic flag line: may hold a bare flag ("enabled"), a combined
             # set ("enabled connected priority 1"), or just a priority.
@@ -384,6 +404,11 @@ class AutomationEngine:
         if self._session is not None and self._session.is_running:
             tool_error("Session already running. Call session_stop first.")
 
+        if screen_width < 0:
+            tool_error(f"Invalid screen_width {screen_width}: must be >= 0 (0 = auto-detect)")
+        if screen_height < 0:
+            tool_error(f"Invalid screen_height {screen_height}: must be >= 0 (0 = auto-detect)")
+
         # Auto-detect the visible desktop size when not explicitly requested.
         # 0 in either dimension means "match the current desktop": both
         # dimensions are resolved together from detection, so a partially
@@ -391,7 +416,7 @@ class AutomationEngine:
         # caller height into a nonsensical aspect ratio. Detection runs at
         # every call so a changed desktop size is applied to the next
         # virtual session (adopted from 01SW/kwin-mcp).
-        if screen_width <= 0 or screen_height <= 0:
+        if screen_width == 0 or screen_height == 0:
             screen_width, screen_height = _detect_physical_screen_size()
 
         self._clipboard_enabled = enable_clipboard

@@ -26,8 +26,11 @@ import subprocess
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 import kwin_mcp.core as core_module
 from kwin_mcp.core import _DEFAULT_VIRTUAL_SIZE, AutomationEngine, _detect_physical_screen_size
+from kwin_mcp.errors import ToolError
 
 
 def _which(monkeypatch: Any, available: dict[str, str]) -> Any:
@@ -573,3 +576,78 @@ def test_session_start_partial_zero_resolves_both(monkeypatch) -> None:
     config = session.last_config
     assert config.screen_width == 2560
     assert config.screen_height == 1440
+
+
+def test_detect_kscreen_doctor_geometry_on_output_line(monkeypatch) -> None:
+    """Geometry compacted onto the Output line itself is recognised.
+
+    Regression for #21 P5: some kscreen-doctor versions emit flags AND the
+    geometry on the single ``Output:`` line (the code comment already
+    acknowledged the compact form for flags). The old parser only matched a
+    line STARTING with ``Geometry:``, so the compact form yielded None and
+    detection silently fell back to 1920x1080.
+    """
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 eDP-1 enabled connected priority 1 Geometry: 0,0 2560x1440\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (2560, 1440)
+
+
+def test_detect_kscreen_doctor_geometry_on_output_line_disabled(monkeypatch) -> None:
+    """A disabled flag on the compact Output line still excludes its geometry."""
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1 disabled connected priority 1 Geometry: 0,0 3840x2160\n"
+            "Output: 2 eDP-1 enabled connected priority 1 Geometry: 0,0 1280x720\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (1280, 720)
+
+
+def test_session_start_negative_width_raises(monkeypatch) -> None:
+    """A negative screen_width is a ToolError, not silent auto-detect.
+
+    Regression for #21 P6: the API documents only ``0 = auto-detect``;
+    negatives must fail loudly. The check runs before detection, so a
+    negative size never shells out to kscreen-doctor.
+    """
+    engine, _session = _engine(monkeypatch, detected=(2560, 1440))
+
+    def fail_detect() -> tuple[int, int]:
+        msg = "detection must not run for negative sizes"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(core_module, "_detect_physical_screen_size", fail_detect)
+
+    with pytest.raises(ToolError, match="screen_width"):
+        engine.session_start(screen_width=-1, screen_height=720)
+
+
+def test_session_start_negative_height_raises(monkeypatch) -> None:
+    """A negative screen_height is a ToolError, not silent auto-detect."""
+    engine, _session = _engine(monkeypatch, detected=(2560, 1440))
+
+    def fail_detect() -> tuple[int, int]:
+        msg = "detection must not run for negative sizes"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(core_module, "_detect_physical_screen_size", fail_detect)
+
+    with pytest.raises(ToolError, match="screen_height"):
+        engine.session_start(screen_width=1280, screen_height=-1080)
