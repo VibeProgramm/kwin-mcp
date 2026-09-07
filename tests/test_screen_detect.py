@@ -1,11 +1,22 @@
-"""Tests for physical screen size auto-detection (session_start 0-semantics).
+"""Tests for visible desktop size auto-detection (session_start 0-semantics).
 
 Adopted from 01SW/kwin-mcp: ``session_start`` used to hardcode a 1920x1080
 virtual screen, so a virtual session on a different physical display got a
 mismatched size. ``screen_width=0``/``screen_height=0`` (now the default)
-means "match the physical display", detected at every session_start via
+means "match the visible desktop", detected at every session_start via
 kscreen-doctor (KDE) → xrandr (X11) → 1920x1080 fallback; explicit values
 keep priority.
+
+Parsing specifics covered here (from the 01SW verification round):
+
+- kscreen-doctor colourises its output with ANSI escapes even when piped
+  (real dump in /tmp/opencode/verif-kscreen.out) — escapes must be stripped
+  before any ``startswith`` check,
+- a disabled output's Geometry line must be skipped (it may be stale); the
+  enabled output's geometry is used; among several enabled outputs,
+  ``priority 1`` wins,
+- xrandr prints ``Screen ... current`` BEFORE the per-monitor lines, so the
+  primary monitor must win over the desktop-wide current size.
 """
 
 from __future__ import annotations
@@ -48,13 +59,92 @@ def test_detect_kscreen_doctor_geometry(monkeypatch) -> None:
     assert _detect_physical_screen_size() == (2560, 1440)
 
 
-def test_detect_kscreen_doctor_skips_disabled_outputs(monkeypatch) -> None:
-    """Only lines starting with 'Geometry:' are parsed; noise is ignored.
+def test_detect_kscreen_doctor_real_ansi_output(monkeypatch) -> None:
+    """Real kscreen-doctor output (SGR-coloured, piped) parses to its geometry.
 
-    (kscreen-doctor prints a Geometry line per output; a disabled output has
-    no enabled marker in our parse — first Geometry line wins, matching the
-    01SW reference implementation.)
+    Regression for A1: kscreen-doctor emits ANSI escape sequences even with
+    capture_output, so an unstripped ``startswith("Geometry:")`` never
+    matched and detection silently fell back to 1920x1080. The fixture is
+    the actual byte stream captured from a live KDE session
+    (/tmp/opencode/verif-kscreen.out), whose true geometry is 1746x982
+    (Scale 1.1) — not the fallback default.
     """
+    real_dump = (
+        "\x1b[01;32mOutput: \x1b[0;0m1 eDP-1 ebe3aedd-465b-41d0-ade3-79701cdf6a8a\n"
+        "\t\x1b[01;32menabled\x1b[0;0m\n"
+        "\t\x1b[01;32mconnected\x1b[0;0m\n"
+        "\t\x1b[01;32mpriority 1\x1b[0;0m\n"
+        "\t\x1b[01;33mPanel\x1b[0;0m\n"
+        "\t\x1b[01;33mreplication source:\x1b[0;0m0\n"
+        "\t\x1b[01;34mModes: \x1b[0;0m 1:\x1b[01;32m1920x1080@60.01*\x1b[0;0m!  "
+        "2:1680x1050@60.01  3:1280x1024@60.01\n"
+        "\t\x1b[01;33mCustom modes:\x1b[0;0m None\n"
+        "\t\x1b[01;33mGeometry: \x1b[0;0m0,0 1746x982\n"
+        "\t\x1b[01;33mScale: \x1b[0;0m1.1\n"
+        "\t\x1b[01;33mRotation: \x1b[0;0m1\n"
+        "\t\x1b[01;33mOverscan: \x1b[0;0m0\n"
+        "\t\x1b[01;33mVrr: \x1b[0;0mincapable\n"
+        "\t\x1b[01;33mHdr: \x1b[0;0mincapable\n"
+    )
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(core_module.subprocess, "run", lambda *a, **k: _run_result(real_dump))
+    assert _detect_physical_screen_size() == (1746, 982)
+
+
+def test_detect_kscreen_doctor_skips_disabled_output_with_geometry(monkeypatch) -> None:
+    """A disabled output WITH a Geometry line is skipped; the enabled one wins.
+
+    Regression for B1: the old parser took the first ``Geometry:`` line in
+    the stream without binding it to its Output block, so a disabled output
+    carrying a stale geometry shadowed the active one.
+    """
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1 disabled\n"
+            "Geometry: 0,0 1920x1080\n"
+            "Output: 2 eDP-1 enabled\n"
+            "priority 1\n"
+            "Geometry: 0,0 2560x1440\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (2560, 1440)
+
+
+def test_detect_kscreen_doctor_priority_one_wins_among_enabled(monkeypatch) -> None:
+    """Two enabled outputs → the priority-1 one is chosen (B1)."""
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 HDMI-A-1 enabled\n"
+            "priority 2\n"
+            "Geometry: 0,0 1680x1050\n"
+            "Output: 2 eDP-1 enabled\n"
+            "priority 1\n"
+            "Geometry: 1920,0 2560x1440\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (2560, 1440)
+
+
+def test_detect_kscreen_doctor_no_enabled_outputs_falls_through(monkeypatch) -> None:
+    """kscreen-doctor present but all outputs disabled → xrandr/default takes over."""
     monkeypatch.setattr(
         core_module.shutil,
         "which",
@@ -65,7 +155,8 @@ def test_detect_kscreen_doctor_skips_disabled_outputs(monkeypatch) -> None:
         "run",
         lambda *a, **k: _run_result("Output: 1 DP-1 disabled\nGeometry: 0,0 1920x1080\n"),
     )
-    assert _detect_physical_screen_size() == (1920, 1080)
+    # No xrandr available → default fallback.
+    assert _detect_physical_screen_size() == _DEFAULT_VIRTUAL_SIZE
 
 
 def test_detect_falls_back_to_xrandr_primary(monkeypatch) -> None:
@@ -82,6 +173,28 @@ def test_detect_falls_back_to_xrandr_primary(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(core_module.subprocess, "run", fake_run)
+    assert _detect_physical_screen_size() == (1920, 1080)
+
+
+def test_detect_xrandr_primary_beats_earlier_screen_current(monkeypatch) -> None:
+    """xrandr Screen-current printed BEFORE the primary line → primary wins.
+
+    Regression for B2: xrandr prints ``Screen 0: ... current 4480x1440``
+    (the whole desktop) before per-monitor lines, so the old single-pass
+    parser returned the desktop size instead of the primary monitor's.
+    """
+    monkeypatch.setattr(
+        core_module.shutil, "which", _which(monkeypatch, {"xrandr": "/usr/bin/xrandr"})
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Screen 0: minimum 320 x 200, current 4480 x 1440, maximum 32767 x 32767\n"
+            "DP-1 connected primary 1920x1080+0+0 (normal left inverted right) 509mm x 286mm\n"
+            "DP-2 connected 2560x1440+1920+0 (normal left inverted right) 597mm x 336mm\n"
+        ),
+    )
     assert _detect_physical_screen_size() == (1920, 1080)
 
 
@@ -203,7 +316,7 @@ def _engine(monkeypatch, detected: tuple[int, int]) -> tuple[AutomationEngine, _
 
 
 def test_session_start_zero_resolves_detected_size(monkeypatch) -> None:
-    """screen 0/0 (the new default) → the detected physical size is used."""
+    """screen 0/0 (the new default) → the detected desktop size is used."""
     engine, session = _engine(monkeypatch, detected=(2560, 1440))
 
     engine.session_start()

@@ -30,15 +30,109 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_VIRTUAL_SIZE = (1920, 1080)
 
+# kscreen-doctor colourises its output with SGR escape sequences even when
+# piped (capture_output), e.g. '\x1b[01;33m\tGeometry: \x1b[0;0m0,0 1746x982' —
+# every line must be stripped before any startswith() check (A1).
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(line: str) -> str:
+    """Strip ANSI escape sequences from one output line."""
+    return _ANSI_ESCAPE_RE.sub("", line)
+
+
+def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
+    """Return the geometry of the best enabled output from ``kscreen-doctor -o``.
+
+    The output is a list of per-output blocks starting with an "Output:" line
+    and containing flag lines ("enabled"/"disabled", "priority N") plus a
+    "Geometry: x,y WxH" line. Only enabled outputs are considered — a
+    disabled output may still print a (stale) Geometry line. Among several
+    enabled outputs, one with ``priority 1`` wins, otherwise the first
+    enabled one is used (B1). The geometry is the visible desktop size
+    (logical, already scaled by the compositor).
+    """
+    best: tuple[int, int] | None = None
+    best_priority = -1
+    enabled = False
+    priority = 0
+    geometry: tuple[int, int] | None = None
+
+    def finish_block() -> None:
+        nonlocal best, best_priority
+        if not enabled or geometry is None:
+            return
+        # First enabled output wins; a priority-1 output outranks an earlier
+        # enabled output without priority 1.
+        if best is None or (priority == 1 and best_priority != 1):
+            best = geometry
+            best_priority = priority
+
+    for raw_line in output.splitlines():
+        line = _strip_ansi(raw_line).strip()
+        if line.startswith("Output:"):
+            finish_block()
+            enabled = False
+            priority = 0
+            geometry = None
+            # Some kscreen-doctor versions put the flags on the "Output:"
+            # line itself ("Output: 1 eDP-1 enabled connected priority 1");
+            # others print them as indented follow-up lines.
+            rest = line[len("Output:") :]
+            if "enabled" in rest.split():
+                enabled = True
+            prio_match = re.search(r"priority\s+(\d+)", rest)
+            if prio_match:
+                priority = int(prio_match.group(1))
+        elif line == "enabled":
+            enabled = True
+        elif line.startswith("priority "):
+            try:
+                priority = int(line.split()[-1])
+            except ValueError:
+                priority = 0
+        elif line.startswith("Geometry:"):
+            match = re.search(r"\b(\d+)x(\d+)\b", line)
+            if match:
+                geometry = (int(match.group(1)), int(match.group(2)))
+    finish_block()
+    return best
+
+
+def _parse_xrandr(output: str) -> tuple[int, int] | None:
+    """Return the desktop size from ``xrandr`` output.
+
+    Two-pass within one scan: the primary monitor line
+    ("DP-1 connected primary 1920x1080+0+0") always wins; the
+    "Screen 0: ... current W x H" line is only a fallback. xrandr prints the
+    Screen line first, so a single-pass scan would return the size of the
+    whole desktop instead of the primary monitor (B2).
+    """
+    primary: tuple[int, int] | None = None
+    current: tuple[int, int] | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if primary is None and re.search(r"\bconnected\b", line) and "primary" in line:
+            match = re.search(r"\b(\d+)x(\d+)\b", line)
+            if match:
+                primary = (int(match.group(1)), int(match.group(2)))
+        elif current is None and line.startswith("Screen ") and "current " in line:
+            # xrandr renders the current size with spaces around 'x'.
+            match = re.search(r"current\s+(\d+)\s*x\s*(\d+)", line)
+            if match:
+                current = (int(match.group(1)), int(match.group(2)))
+    return primary if primary is not None else current
+
 
 def _detect_physical_screen_size() -> tuple[int, int]:
-    """Detect the current physical screen resolution.
+    """Detect the visible desktop resolution of the current session.
 
     Uses kscreen-doctor (KDE) first, falling back to xrandr for X11 sessions.
-    Returns (width, height) of the active display, or the default size when
-    detection fails. Called at every session_start so a changed physical
-    display size is picked up by the next virtual session (adopted from
-    01SW/kwin-mcp).
+    Returns the (width, height) of the best active display — the visible
+    (logical) desktop size as the compositor scales it, not the raw panel
+    pixel size — or the default size when detection fails. Called at every
+    session_start so a changed desktop size is picked up by the next virtual
+    session (adopted from 01SW/kwin-mcp).
     """
     # kscreen-doctor: Geometry line of an enabled output, e.g. "Geometry: 0,0 1920x1080"
     if shutil.which("kscreen-doctor"):
@@ -46,14 +140,9 @@ def _detect_physical_screen_size() -> tuple[int, int]:
             result = subprocess.run(
                 ["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=5
             )
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if not line.startswith("Geometry:"):
-                    continue
-                match = re.search(r"\d+x\d+", line)
-                if match:
-                    w, h = match.group().split("x", 1)
-                    return int(w), int(h)
+            size = _parse_kscreen_doctor(result.stdout)
+            if size is not None:
+                return size
         except (subprocess.SubprocessError, OSError, ValueError):
             pass
 
@@ -61,17 +150,9 @@ def _detect_physical_screen_size() -> tuple[int, int]:
     if shutil.which("xrandr"):
         try:
             result = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=5)
-            for line in result.stdout.splitlines():
-                if "connected" in line and "primary" in line:
-                    match = re.search(r"\b(\d+)x(\d+)", line)
-                    if match:
-                        return int(match.group(1)), int(match.group(2))
-                elif line.startswith("Screen ") and "current " in line:
-                    # "Screen 0: minimum 8 x 8, current 2560 x 1440, ..." —
-                    # xrandr renders the current size with spaces around 'x'.
-                    match = re.search(r"current\s+(\d+)\s*x\s*(\d+)", line)
-                    if match:
-                        return int(match.group(1)), int(match.group(2))
+            size = _parse_xrandr(result.stdout)
+            if size is not None:
+                return size
         except (subprocess.SubprocessError, OSError, ValueError):
             pass
 
@@ -272,9 +353,9 @@ class AutomationEngine:
         if self._session is not None and self._session.is_running:
             tool_error("Session already running. Call session_stop first.")
 
-        # Auto-detect physical screen size when not explicitly requested.
-        # 0 means "match the physical display"; detection runs at every call
-        # so a changed display size is applied to the next virtual session
+        # Auto-detect the visible desktop size when not explicitly requested.
+        # 0 means "match the current desktop"; detection runs at every call
+        # so a changed desktop size is applied to the next virtual session
         # (adopted from 01SW/kwin-mcp).
         if screen_width <= 0 or screen_height <= 0:
             screen_width, screen_height = _detect_physical_screen_size()
