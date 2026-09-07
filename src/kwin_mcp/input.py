@@ -175,14 +175,27 @@ _STALL_READY_TIMEOUT_S = 0.5
 # when the budget is exhausted the injection fails loudly with the attempt
 # count instead of being silently dropped into a paused device.
 #
-# Budget: 3 attempts x (fresh handshake <=5s + 0.5s re-check) keeps the worst
-# case at ~3-4s of controllable wait per call in the live cycle (each
-# handshake there completes in well under the 5s negotiation deadline) and
-# each attempt resolves in hundreds of milliseconds. A reconnect that RAISES
-# (D-Bus/libei/handshake error) still aborts immediately — retrying a hard
-# failure adds only latency, the error is already honest (#229/F1 keep the
-# state clean for the next call).
+# Budget: 3 attempts, each getting one short re-check window; when the
+# budget is exhausted the injection fails loudly with the attempt count
+# instead of being silently dropped into a paused device. A reconnect that
+# RAISES (D-Bus/libei/handshake error) still aborts immediately — retrying
+# a hard failure adds only latency, the error is already honest (#229/F1
+# keep the state clean for the next call).
+#
+# In the live cycle each handshake resolves in hundreds of milliseconds,
+# so the loop ends in ~3-4s as before — but the attempt count alone does
+# not bound one call: a wedged handshake can sit in _negotiate_devices up
+# to its 5s deadline on EVERY attempt (≈17s worst case). The loop therefore
+# additionally stops on the wall-clock budget below (issue #16, F7).
 _RECONNECT_ATTEMPTS = 3
+
+# Overall wall-clock bound for one _ensure_devices_ready call (issue #16,
+# F7), measured from the gate entry alongside the attempt count. Honest
+# worst case per call: the stall wait (0.5s) + this budget (4s) + one
+# in-flight handshake already past the deadline check (<=5s) + its
+# re-check (0.5s) ≈ 10s; in the live cycle (fast handshakes) the loop
+# still ends in ~3-4s.
+_RECONNECT_WALL_BUDGET_S = 4.0
 
 # Post-reconnect re-check window for extra required device slots (text/touch)
 # and for the fresh handshake's devices in general (#235 retry loop): a
@@ -510,6 +523,15 @@ class EISClient:
         EI context or a live D-Bus cookie. Used by the handshake failure
         path and by ``_reconnect`` (F3: the rebuild must be as defensive as
         the handshake teardown, not a less-guarded duplicate of it).
+
+        One multi-capability handle may occupy several slots
+        (``_register_device`` puts it into every matching one, issue #16
+        F2): the slots are cleared first, then each UNIQUE handle is
+        stopped/unref'd once — a per-slot unref would release a live handle
+        several times. Every per-device step and the context release are
+        individually suppressed (issue #16, F4): a failing
+        ``stop_emulating``/``unref`` must not skip the remaining handles or
+        the context reset below.
         """
         with contextlib.suppress(dbus.DBusException):
             if self._eis_iface and self._cookie:
@@ -518,18 +540,24 @@ class EISClient:
         # cookie must not leak into the fresh handshake after a rebuild.
         self._cookie = 0
         self._invalidate_touches()
+        devices = [getattr(self, attr) for attr in _DEVICE_ATTRS]
         for attr in _DEVICE_ATTRS:
-            existing = getattr(self, attr)
-            if existing:
-                # Started devices must stop emulating before release.
-                if existing in self._emulating_devices:
-                    _get_libei().ei_device_stop_emulating(existing)
-                _get_libei().ei_device_unref(existing)
-                setattr(self, attr, 0)
+            setattr(self, attr, 0)
+        for device in dict.fromkeys(devices):
+            if not device:
+                continue
+            # Started devices must stop emulating before release.
+            if device in self._emulating_devices:
+                with contextlib.suppress(Exception):
+                    _get_libei().ei_device_stop_emulating(device)
+            self._emulating_devices.discard(device)
+            with contextlib.suppress(Exception):
+                _get_libei().ei_device_unref(device)
         self._emulating_devices.clear()
         self._sequence = 0
         if self._ei:
-            _get_libei().ei_unref(self._ei)
+            with contextlib.suppress(Exception):
+                _get_libei().ei_unref(self._ei)
             self._ei = 0
         self._connection_dead = False
 
@@ -545,11 +573,20 @@ class EISClient:
         Per-touch failures are suppressed: a dead connection must not abort
         the cleanup before the touches are unref'd and dropped (leaking them
         would leave dangling pointers into a released EI context, A3).
+
+        On a dead or released connection no ``touch_up`` is sent at all
+        (issue #16, F6): finishing a gesture into a dead context is
+        meaningless — releasing (unref + drop) is the required part. The
+        liveness read mirrors the guards the readiness wait uses
+        (``_connection_dead`` / ``_ei == 0``).
         """
+        live = not self._connection_dead and self._ei != 0
         for touch in self._active_touches.values():
-            with contextlib.suppress(RuntimeError):
-                _get_libei().ei_touch_up(touch)
-            _get_libei().ei_touch_unref(touch)
+            if live:
+                with contextlib.suppress(Exception):
+                    _get_libei().ei_touch_up(touch)
+            with contextlib.suppress(Exception):
+                _get_libei().ei_touch_unref(touch)
         self._active_touches.clear()
         self._next_touch_id = 0
 
@@ -604,6 +641,13 @@ class EISClient:
             if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
                 break
 
+        if self._connection_dead:
+            # DISCONNECT (or a dispatch failure) arrived mid-handshake: the
+            # registered slots are stale handles of a dead connection, so the
+            # handshake must fail instead of reporting success on them
+            # (issue #16, F5). The wrapper tears the half-state down.
+            msg = "EIS connection lost during handshake (DISCONNECT or dispatch failure)"
+            raise RuntimeError(msg)
         if not self._pointer:
             msg = "No pointer device available from EIS"
             raise RuntimeError(msg)
@@ -659,15 +703,21 @@ class EISClient:
         All logically-down touches die with the seat and are released via
         ``_invalidate_touches`` (F4): their stored pointers must not survive
         the state reset.
+
+        One multi-capability handle may occupy several slots — each unique
+        handle is unref'd once (issue #16, F2).
         """
         _ei_debug("seat removed; dropping all devices")
         self._invalidate_touches()
+        seen: set[int] = set()
         for attr in _DEVICE_ATTRS:
             device = getattr(self, attr)
             if device:
                 self._emulating_devices.discard(device)
                 setattr(self, attr, 0)
-                _get_libei().ei_device_unref(device)
+                if device not in seen:
+                    seen.add(device)
+                    _get_libei().ei_device_unref(device)
         self._emulating_devices.clear()
 
     def _resume_device(self, event: int) -> None:
@@ -745,13 +795,27 @@ class EISClient:
         Shared by the handshake, the readiness wait and the post-send flush
         so PAUSED/REMOVED/RESUMED transitions are processed wherever they
         arrive instead of sitting queued until the next deadline.
+
+        Every popped event is unref'd exactly once, including on the error
+        path (issue #16, F1): ``ei_event_unref`` has a refcount contract and
+        a raising handler must not leak the FFI reference.
+
+        The drain stops after a DISCONNECT (issue #16, F5): it is the last
+        event of the connection (libei), so anything still queued — e.g. a
+        RESUMED — belongs to the dead connection and must not
+        ``start_emulating`` or replay held state on it. The teardown of the
+        next reconnect releases the whole context, queued events included.
         """
         while True:
             event = _get_libei().ei_get_event(self._ei)
             if not event:
                 break
-            self._handle_event(event)
-            _get_libei().ei_event_unref(event)
+            try:
+                self._handle_event(event)
+            finally:
+                _get_libei().ei_event_unref(event)
+            if self._connection_dead:
+                break
 
     def _required_ready(self, require_attrs: tuple[str, ...] = ()) -> bool:
         """Whether pointer + keyboard (plus any extra named slots) emulate.
@@ -850,17 +914,25 @@ class EISClient:
         Removing a device releases its logically-down touches (libei resets
         the device state), so dropping the touch device also invalidates the
         active gestures (F4).
+
+        One multi-capability handle may occupy several slots — the unique
+        handle is unref'd once (issue #16, F2).
         """
         device = _get_libei().ei_event_get_device(event)
+        if not device:
+            return
         _ei_debug(f"device removed: {device}")
         # Whether the removed device occupies the touch slot, checked BEFORE
         # the loop clears the slots (comparing after would always see 0).
-        was_touch_device = device != 0 and device == self._touch_device
+        was_touch_device = device == self._touch_device
+        matched = False
         for attr in _DEVICE_ATTRS:
             if getattr(self, attr) == device:
                 setattr(self, attr, 0)
                 self._emulating_devices.discard(device)
-                _get_libei().ei_device_unref(device)
+                matched = True
+        if matched:
+            _get_libei().ei_device_unref(device)
         if was_touch_device:
             self._invalidate_touches()
 
@@ -902,11 +974,14 @@ class EISClient:
         therefore retried a bounded number of times (``_RECONNECT_ATTEMPTS``),
         each attempt getting one ``_POST_RECONNECT_READY_TIMEOUT_S`` re-check
         window; exhausting the budget tears the connection down and fails
-        loudly with the attempt count. A reconnect that raises inside
-        ``_setup`` (D-Bus/libei/handshake error) still aborts immediately:
-        the state is already clean (#229) and retrying a hard failure only
-        adds latency. The pre-reconnect stall wait was shortened to
-        ``_STALL_READY_TIMEOUT_S`` accordingly.
+        loudly with the attempt count. The loop additionally stops on the
+        ``_RECONNECT_WALL_BUDGET_S`` wall-clock deadline measured from the
+        gate entry (issue #16, F7): the attempt count alone does not bound
+        one call, and the ToolError names the attempts actually made. A
+        reconnect that raises inside ``_setup`` (D-Bus/libei/handshake
+        error) still aborts immediately: the state is already clean (#229)
+        and retrying a hard failure only adds latency. The pre-reconnect
+        stall wait was shortened to ``_STALL_READY_TIMEOUT_S`` accordingly.
 
         After each successful reconnect the requested ``require_attrs`` slots
         are re-checked against the FRESH connection (bounded re-wait, issue
@@ -932,7 +1007,11 @@ class EISClient:
         """
         if self._wait_emulating(timeout_s, require_attrs):
             return
+        budget_start = time.monotonic()
+        attempts_made = 0
         for attempt in range(1, _RECONNECT_ATTEMPTS + 1):
+            if time.monotonic() - budget_start >= _RECONNECT_WALL_BUDGET_S:
+                break
             _ei_debug(
                 f"devices stalled; reconnecting EIS (attempt {attempt}/{_RECONNECT_ATTEMPTS})"
             )
@@ -940,9 +1019,11 @@ class EISClient:
                 self._reconnect()
             except (ToolError, RuntimeError) as exc:
                 tool_error(f"EIS reconnect failed: {exc}")
+            attempts_made += 1
             if self._wait_emulating(_POST_RECONNECT_READY_TIMEOUT_S, require_attrs):
                 return
         self._teardown_connection()
+        attempt_word = "attempt" if attempts_made == 1 else "attempts"
         missing = ", ".join(
             attr.removeprefix("_")
             for attr in require_attrs
@@ -969,16 +1050,16 @@ class EISClient:
             self._held_buttons.clear()
             tool_error(
                 f"EIS did not restore the requested input devices "
-                f"({missing or 'pointer/keyboard'}) after {_RECONNECT_ATTEMPTS} "
-                "reconnect attempts; injection aborted instead of being silently "
+                f"({missing or 'pointer/keyboard'}) after {attempts_made} reconnect "
+                f"{attempt_word}; injection aborted instead of being silently "
                 "dropped into a paused device. Held key/button state was reset "
                 "(the server released all logically down input on pause) — "
                 "re-press the modifier/button if it is still needed."
             )
         tool_error(
             f"EIS did not restore the requested input devices "
-            f"({missing or 'pointer/keyboard'}) after {_RECONNECT_ATTEMPTS} "
-            "reconnect attempts; injection aborted instead of being silently "
+            f"({missing or 'pointer/keyboard'}) after {attempts_made} reconnect "
+            f"{attempt_word}; injection aborted instead of being silently "
             "dropped into a paused device."
         )
 
@@ -988,11 +1069,13 @@ class EISClient:
         The queue is drained on every iteration (not only when the fd is
         readable): events queued by a previous dispatch would otherwise sit
         unprocessed until the deadline expires. The drain runs BEFORE the
-        readiness probe: a queue left by a prior loop (e.g. the handshake's
-        last pass on a fresh connection) may still hold the DEVICE_ADDED /
-        RESUMED events of a late-resuming extra device (issue #228) —
-        probing first would short-circuit on pointer + keyboard alone and
-        report ready before those events are ever processed. A dead
+        readiness probe AND before the first ``select`` wait: a queue left by
+        a prior loop (e.g. the handshake's last pass on a fresh connection)
+        may still hold the DEVICE_ADDED / RESUMED events of a late-resuming
+        extra device (issue #228) — probing first would short-circuit on
+        pointer + keyboard alone and report ready before those events are
+        ever processed, and selecting first would burn up to 50ms before
+        already-queued events are even seen (issue #16, F8). A dead
         connection (DISCONNECT event or failed dispatch) makes the
         wait fail immediately so the caller takes the reconnect path.
 
@@ -1003,9 +1086,14 @@ class EISClient:
         server instead of raising one clean ToolError.
         """
         deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
+        while True:
             if self._connection_dead or self._ei == 0:
                 return False
+            self._drain_events()
+            if self._required_ready(require_attrs):
+                return True
+            if time.monotonic() >= deadline:
+                break
             ei_fd = _get_libei().ei_get_fd(self._ei)
             readable, _, _ = select.select([ei_fd], [], [], 0.05)
             if readable:
@@ -1013,9 +1101,6 @@ class EISClient:
                 if ret < 0:
                     self._connection_dead = True
                     return False
-            self._drain_events()
-            if self._required_ready(require_attrs):
-                return True
         return self._required_ready(require_attrs)
 
     def _reconnect(self) -> None:
@@ -1062,19 +1147,25 @@ class EISClient:
         paths (``_teardown_connection`` → ``_invalidate_touches``, ``close``)
         talk to libei directly and stay exception-tolerant.
 
-        A NULL (0) EI context marks the connection dead without touching
-        libei (F1): ``ei_dispatch(0)`` segfaults, and no dispatch is ever
-        meaningful on a torn-down connection. (Unreachable after a
+        A NULL (0) EI context marks the connection dead and raises ToolError
+        (issue #16, F3): ``ei_dispatch(0)`` segfaults, no dispatch is ever
+        meaningful on a torn-down connection — and a silent return would
+        report success for an injection that never reached libei, against
+        the honest-delivery contract above. (Unreachable after a
         successful readiness gate — a failed gate raises before any
         injection runs.)
 
         Raises:
             ToolError: when ``ei_dispatch`` fails after this operation's
-                events were sent — delivery is unconfirmed.
+                events were sent — delivery is unconfirmed — or when the EI
+                context is already released.
         """
         if self._ei == 0:
             self._connection_dead = True
-            return
+            tool_error(
+                "EIS context is released (no live connection); the injection "
+                "was not delivered — the next call rebuilds the connection."
+            )
         if _get_libei().ei_dispatch(self._ei) < 0:
             self._connection_dead = True
             tool_error(
@@ -1302,11 +1393,11 @@ class EISClient:
 
     def close(self) -> None:
         """Clean up EIS connection."""
-        # Release any lingering touches
-        for touch in self._active_touches.values():
-            _get_libei().ei_touch_up(touch)
-            _get_libei().ei_touch_unref(touch)
-        self._active_touches.clear()
+        # Release any lingering touches through the shared helper: on a dead
+        # connection it unrefs + drops without sending touch_up into the
+        # void (issue #16, F6), and per-touch failures never abort the
+        # device cleanup below.
+        self._invalidate_touches()
         self._emulating_devices.clear()
 
         if self._touch_device and self._touch_device not in (self._pointer, self._keyboard):
