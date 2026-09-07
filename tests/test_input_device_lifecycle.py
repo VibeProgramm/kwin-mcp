@@ -578,10 +578,16 @@ def test_disconnect_event_flags_dead_connection_instead_of_raising(monkeypatch) 
 
 
 def test_dispatch_failure_triggers_reconnect_on_next_injection(monkeypatch) -> None:
-    """ei_dispatch() < 0 (dead socket, no DISCONNECT event) → reconnect path.
+    """ei_dispatch() < 0 (dead socket, no DISCONNECT event) → ToolError, then recovery.
 
     Regression for B3(a): the negative return used to be ignored, leaving the
     client "emulating" forever and injecting into a void.
+
+    Contract change (issue #234 — NOT a test weakening): the first injection
+    used to return success while the event was silently lost (at-most-once +
+    silent loss). Honest delivery semantics raise ToolError from the post-send
+    flush (delivery unconfirmed) and deliver on the NEXT injection, which
+    rebuilds the connection.
     """
     fake = FakeLibei([], {})
     fake.dispatch_result = -1
@@ -589,12 +595,75 @@ def test_dispatch_failure_triggers_reconnect_on_next_injection(monkeypatch) -> N
     client = _client(fake)
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
-    client.keyboard_key(30, _PRESSED)  # flush marks the connection dead
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.keyboard_key(30, _PRESSED)  # flush dispatches into a dead socket
     assert client._connection_dead is True
+    assert fake.key_calls == [(30, _PRESSED)]  # sent, delivery unconfirmed
 
-    client.keyboard_key(31, _PRESSED)  # next injection rebuilds the connection
+    fake.dispatch_result = 0  # a rebuilt connection dispatches fine
+    client.keyboard_key(31, _PRESSED)  # next injection rebuilds and delivers
     assert setup_calls == [1]
     assert fake.key_calls == [(30, _PRESSED), (31, _PRESSED)]
+
+
+def test_pointer_button_dispatch_failure_raises_tool_error(monkeypatch) -> None:
+    """pointer_button with a post-send dispatch error raises ToolError (issue #234).
+
+    Same honest-delivery contract as keyboard_key: the button event was sent
+    into a dead socket, delivery is unconfirmed — the caller must see the
+    failure instead of a silent success.
+    """
+    fake = FakeLibei([], {})
+    fake.dispatch_result = -1
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.pointer_button(0x110, _PRESSED)
+    assert client._connection_dead is True
+    assert fake.button_calls == [(0x110, _PRESSED)]
+
+
+def test_paused_after_send_is_not_tool_error(monkeypatch) -> None:
+    """A plain PAUSED is NOT a delivery error — normal event flow (issue #234).
+
+    Issue #234 scopes the ToolError to ``ei_dispatch < 0`` only: KWin pauses
+    its EIS devices around input bursts as normal operation. Here the pause
+    is drained by the readiness gate, the connection is rebuilt, and the
+    injection lands on the fresh devices — no ToolError, delivery succeeded.
+    """
+    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    client = _client(fake)
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
+
+    client.keyboard_key(30, _PRESSED)  # gate drains PAUSED, reconnects, delivers
+
+    assert setup_calls == [1]  # normal reconnect, not a delivery failure
+    assert client._connection_dead is False
+    assert fake.key_calls == [(30, _PRESSED)]
+    assert client._emulating_devices == {NEW_POINTER, NEW_KEYBOARD}
+
+
+def test_touch_down_unrefs_touch_on_delivery_failure(monkeypatch) -> None:
+    """A touch_down whose flush fails unrefs the touch it never registered.
+
+    The touch enters ``_active_touches`` only AFTER a successful flush (issue
+    #234): when the flush raises ToolError the orphaned gesture object must
+    not leak — it is unref'd and no ID is handed out.
+    """
+    fake = FakeLibei([], {})
+    fake.dispatch_result = -1
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.touch_down(5.0, 5.0)
+
+    assert client._active_touches == {}
+    assert len(fake.unrefed_touches) == 1
+    assert fake.touch_downs == [(0x900, 5.0, 5.0)]
 
 
 def test_seat_removed_drops_all_devices(monkeypatch) -> None:

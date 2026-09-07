@@ -965,20 +965,40 @@ class EISClient:
         Draining processes device pause/resume/remove events so our
         emulation bookkeeping stays in sync with the server between
         injections. A negative ``ei_dispatch`` return (dead socket without a
-        DISCONNECT event) marks the connection dead instead of being
-        ignored — the next injection's readiness check then rebuilds the
-        connection instead of sending into a void forever (B3).
+        DISCONNECT event) marks the connection dead and raises ToolError
+        (issue #234): the caller's events were already queued into libei, so
+        delivery is unconfirmed — the operation must surface as a failure to
+        the MCP client instead of a silent success (at-most-once). The next
+        injection's readiness check sees the dead flag and rebuilds the
+        connection. A DISCONNECT event drained here is NOT a dispatch
+        failure: ``ei_dispatch`` itself succeeded, so the established
+        contract stands — flag the dead connection, let the next injection
+        rebuild, do not raise.
+
+        Only the post-send injection paths call this method; the cleanup
+        paths (``_teardown_connection`` → ``_invalidate_touches``, ``close``)
+        talk to libei directly and stay exception-tolerant.
 
         A NULL (0) EI context marks the connection dead without touching
         libei (F1): ``ei_dispatch(0)`` segfaults, and no dispatch is ever
-        meaningful on a torn-down connection.
+        meaningful on a torn-down connection. (Unreachable after a
+        successful readiness gate — a failed gate raises before any
+        injection runs.)
+
+        Raises:
+            ToolError: when ``ei_dispatch`` fails after this operation's
+                events were sent — delivery is unconfirmed.
         """
         if self._ei == 0:
             self._connection_dead = True
             return
         if _get_libei().ei_dispatch(self._ei) < 0:
             self._connection_dead = True
-            return
+            tool_error(
+                "input delivery failed; EIS connection lost (dispatch error) — "
+                "the event was sent but delivery is unconfirmed; the next call "
+                "rebuilds the connection and delivers."
+            )
         self._drain_events()
 
     def pointer_move_absolute(self, x: float, y: float) -> None:
@@ -1136,7 +1156,16 @@ class EISClient:
             raise RuntimeError(msg)
         _get_libei().ei_touch_down(touch, x, y)
         _get_libei().ei_device_frame(device, self._now_us())
-        self._flush()
+        try:
+            self._flush()
+        except ToolError:
+            # The gesture object is registered (and its ownership handed to
+            # the caller via the returned ID) only AFTER a successful flush.
+            # On a delivery failure unref the orphaned touch here, or it
+            # leaks: it is neither in _active_touches (so no reconnect
+            # teardown can release it) nor owned by the caller.
+            _get_libei().ei_touch_unref(touch)
+            raise
 
         touch_id = self._next_touch_id
         self._next_touch_id += 1
