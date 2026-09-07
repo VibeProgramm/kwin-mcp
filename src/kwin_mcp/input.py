@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.util
+import logging
 import os
 import select
 import shutil
@@ -25,15 +26,27 @@ import dbus
 import dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 
-from kwin_mcp.errors import tool_error
+from kwin_mcp.errors import ToolError, tool_error
 
+logger = logging.getLogger(__name__)
+
+# KWIN_MCP_DEBUG_EI=1 enables libei/EIS diagnostics: the kwin_mcp.input logger
+# is raised to DEBUG level and given a stderr handler, so device
+# ADDED/REMOVED/RESUMED/PAUSED events, stalls and reconnects become visible
+# (documented in the README "Debugging" section).
 _DEBUG_EI = os.environ.get("KWIN_MCP_DEBUG_EI") == "1"
+if _DEBUG_EI:
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        _stderr_handler = logging.StreamHandler(sys.stderr)
+        _stderr_handler.setFormatter(logging.Formatter("[EI] %(message)s"))
+        logger.addHandler(_stderr_handler)
+        logger.propagate = False
 
 
 def _ei_debug(msg: str) -> None:
-    """Print an EI debug line to stderr when KWIN_MCP_DEBUG_EI=1 is set."""
-    if _DEBUG_EI:
-        print(f"[EI] {msg}", file=sys.stderr, flush=True)
+    """Log an EI debug line (visible when KWIN_MCP_DEBUG_EI=1 is set)."""
+    logger.debug(msg)
 
 
 class MouseButton(Enum):
@@ -347,12 +360,23 @@ class EISClient:
         self._eis_iface: dbus.Interface | None = None
         self._next_touch_id: int = 0  # auto-increment touch ID
         self._active_touches: dict[int, int] = {}  # touch_id -> ctypes pointer
-        self._sequence: int = 0  # libei start-emulating sequence counter
+        # Start-emulating sequence counter, shared across devices. libei.h
+        # (ei_device_start_emulating): "The sequence number identifies this
+        # transaction between start/stop emulating. It must go up by at least
+        # 1 on each call" — no per-device scoping is required, and a globally
+        # monotonic counter satisfies the per-device reading too (B13).
+        self._sequence: int = 0
         self._emulating_devices: set[int] = set()  # devices currently in emulating state
+        self._connection_dead: bool = False  # set on DISCONNECT / dispatch failure
         self._setup()
 
     def _setup(self) -> None:
-        """Connect to KWin EIS and negotiate devices."""
+        """Connect to KWin EIS and negotiate devices.
+
+        On any failure after the EI context exists, the half-initialized
+        connection is torn down (devices unref'd, context released,
+        bookkeeping reset) before the error propagates (B10).
+        """
         # KWin only exposes the EIS interface when it supports remote input;
         # translate the D-Bus failure so callers can treat the input backend as
         # optional (core.py degrades to "no input backend" on RuntimeError;
@@ -392,8 +416,42 @@ class EISClient:
             msg = f"ei_setup_backend_fd failed: {ret}"
             raise RuntimeError(msg)
 
-        # Process handshake events to get devices
+        # Process handshake events to get devices. _negotiate_devices tears
+        # the connection down itself on failure (partial handshake = pointer
+        # emulating but keyboard missing must not leak zombie state, B10).
         self._negotiate_devices()
+
+    def _teardown_connection(self) -> None:
+        """Release the whole EIS connection and reset all bookkeeping.
+
+        Safe to call on a partially initialized state: every step tolerates
+        zeroed slots. Used by the handshake failure path so a failed setup
+        cannot leak devices, the EI context or a live D-Bus cookie.
+        """
+        with contextlib.suppress(dbus.DBusException):
+            if self._eis_iface and self._cookie:
+                self._eis_iface.disconnect(dbus.Int32(self._cookie))
+                self._cookie = 0
+        for touch in self._active_touches.values():
+            with contextlib.suppress(RuntimeError):
+                _get_libei().ei_touch_up(touch)
+            _get_libei().ei_touch_unref(touch)
+        self._active_touches.clear()
+        self._next_touch_id = 0
+        for attr in ("_touch_device", "_text_device", "_pointer", "_keyboard"):
+            existing = getattr(self, attr)
+            if existing:
+                # Started devices must stop emulating before release.
+                if existing in self._emulating_devices:
+                    _get_libei().ei_device_stop_emulating(existing)
+                _get_libei().ei_device_unref(existing)
+                setattr(self, attr, 0)
+        self._emulating_devices.clear()
+        self._sequence = 0
+        if self._ei:
+            _get_libei().ei_unref(self._ei)
+            self._ei = 0
+        self._connection_dead = False
 
     def _negotiate_devices(self, timeout: float = 5.0) -> None:
         """Process EIS handshake events until pointer + keyboard are emulating.
@@ -410,15 +468,35 @@ class EISClient:
         Emulation starts inside the RESUMED handler (``_resume_device``) so
         the same bookkeeping applies to devices that resume later (touch,
         text) and to re-negotiations after a reconnect.
+
+        On any failure the whole half-initialized state is torn down
+        (started devices stop emulating, devices unref'd, EI context
+        released, bookkeeping reset) before the error propagates, so a
+        failed handshake cannot leak a zombie connection (B10).
         """
+        try:
+            self._negotiate_devices_inner(timeout)
+        except BaseException:
+            self._teardown_connection()
+            raise
+
+    def _negotiate_devices_inner(self, timeout: float) -> None:
+        """Handshake loop proper (teardown handled by ``_negotiate_devices``)."""
         ei_fd = _get_libei().ei_get_fd(self._ei)
         start = time.monotonic()
 
         while time.monotonic() - start < timeout:
+            if self._connection_dead:
+                break
+
             readable, _, _ = select.select([ei_fd], [], [], 0.3)
             if readable:
                 ret = _get_libei().ei_dispatch(self._ei)
                 if ret < 0:
+                    # Dead socket without a DISCONNECT event: mark the
+                    # connection invalid so the next injection rebuilds it
+                    # instead of sending into a void (B3).
+                    self._connection_dead = True
                     break
 
             while True:
@@ -457,13 +535,19 @@ class EISClient:
         device-readiness wait, so PAUSED/REMOVED/RESUMED transitions sent
         mid-session (KWin pauses EIS devices around input bursts) update our
         device bookkeeping wherever they arrive.
+
+        DISCONNECT must not raise from here: a mid-drain exception would skip
+        the bookkeeping reset and bypass the reconnect path. It only marks
+        the connection dead (``_connection_dead``); the next
+        ``_ensure_devices_ready`` call rebuilds the connection.
         """
         etype = _get_libei().ei_event_get_type(event)
         _ei_debug(f"event type={etype}")
         if etype == _EI_EVENT_DISCONNECT:
-            msg = "EIS server disconnected"
-            raise RuntimeError(msg)
-        if etype == _EI_EVENT_SEAT_ADDED:
+            self._connection_dead = True
+        elif etype == _EI_EVENT_SEAT_REMOVED:
+            self._handle_seat_removed()
+        elif etype == _EI_EVENT_SEAT_ADDED:
             self._bind_seat_capabilities(event)
         elif etype == _EI_EVENT_DEVICE_ADDED:
             self._register_device(event)
@@ -474,9 +558,26 @@ class EISClient:
         elif etype == _EI_EVENT_DEVICE_PAUSED:
             self._pause_device(event)
 
+    def _handle_seat_removed(self) -> None:
+        """The seat went away: every device on it is gone (unref + forget)."""
+        _ei_debug("seat removed; dropping all devices")
+        for attr in ("_pointer", "_keyboard", "_touch_device", "_text_device"):
+            device = getattr(self, attr)
+            if device:
+                self._emulating_devices.discard(device)
+                setattr(self, attr, 0)
+                _get_libei().ei_device_unref(device)
+        self._emulating_devices.clear()
+
     def _resume_device(self, event: int) -> None:
-        """Device resumed by the server; request emulation so events flow."""
+        """Device resumed by the server; request emulation so events flow.
+
+        Idempotent: a duplicate RESUMED for an already-emulating device must
+        not restart the emulation sequence (symmetric with ``_pause_device``).
+        """
         device = _get_libei().ei_event_get_device(event)
+        if device in self._emulating_devices:
+            return
         if device in (self._pointer, self._keyboard, self._touch_device, self._text_device):
             self._sequence += 1
             _get_libei().ei_device_start_emulating(device, self._sequence)
@@ -526,8 +627,12 @@ class EISClient:
         """Register a device from a DEVICE_ADDED event.
 
         KWin can remove and re-add its EIS devices between input bursts, so
-        a re-advertised device must always replace any stale reference
-        (adopted from 01SW/kwin-mcp).
+        a re-advertised device must replace any stale reference (adopted from
+        01SW/kwin-mcp). But the server may also advertise a second device of
+        the same capability while the current one is alive and healthy —
+        stealing the slot then would unref a working device mid-flight. A
+        slot is only switched when it is empty or the old device is paused
+        or already removed from the emulation set (B4).
         """
         device = _get_libei().ei_event_get_device(event)
 
@@ -547,14 +652,22 @@ class EISClient:
             self._replace_device_ref("_text_device", device)
 
     def _replace_device_ref(self, attr: str, device: int) -> None:
-        """Switch a device-slot attribute to a newly advertised device."""
+        """Switch a device-slot attribute to a newly advertised device.
+
+        Replacement happens only when the slot is empty, or the current
+        occupant is no longer usable (not in the emulating set, i.e. paused
+        or removed). A live, emulating device keeps its slot.
+        """
         old = getattr(self, attr)
         if old == device:
             return
+        if old and old in self._emulating_devices:
+            # Old device still alive and emulating — do not steal the slot.
+            return
         if old:
             _get_libei().ei_device_unref(old)
+            self._emulating_devices.discard(old)
         setattr(self, attr, _get_libei().ei_device_ref(device))
-        self._emulating_devices.discard(old)
 
     def _remove_device(self, event: int) -> None:
         """Drop a device that the server removed (unref + forget emulation)."""
@@ -571,32 +684,44 @@ class EISClient:
         return int(time.monotonic() * 1_000_000)
 
     def _ensure_devices_ready(self, timeout_s: float = 5.0) -> None:
-        """Wait until pointer + keyboard are emulating, processing events.
+        """Wait until pointer + keyboard are emulating, reconnecting on failure.
+
+        This check is best-effort: KWin may pause or remove its devices
+        between the readiness check and the actual event injection, and such
+        an injection is silently dropped by libei. Batching key strokes into
+        a single frame (``keyboard_burst``) minimises that window; the next
+        injection's dispatch/drain path recovers (adopted from 01SW/kwin-mcp).
 
         KWin can remove/re-add or pause its EIS devices around input bursts
         (observed right after session start and after modifier presses).
         Re-advertised devices are re-registered while draining the event
-        queue; if the connection is stalled (paused devices that never
-        resume), it is rebuilt so injection continues (adopted from
-        01SW/kwin-mcp).
+        queue. If the wait fails — devices stalled (paused without resume),
+        or the connection was marked dead by a DISCONNECT event or a failed
+        ``ei_dispatch`` — the whole connection is rebuilt. A successful
+        reconnect guarantees emulating devices, because ``_setup`` runs the
+        device negotiation itself and raises on failure.
         """
         if self._wait_emulating(timeout_s):
             return
         _ei_debug("devices stalled; reconnecting EIS")
-        self._reconnect()
-        if not self._wait_emulating(3.0):
-            msg = "EIS devices are not in emulating state"
-            raise RuntimeError(msg)
+        try:
+            self._reconnect()
+        except (ToolError, RuntimeError) as exc:
+            tool_error(f"EIS reconnect failed: {exc}")
 
     def _wait_emulating(self, timeout_s: float) -> bool:
         """Wait until pointer + keyboard are emulating, draining events.
 
         The queue is drained on every iteration (not only when the fd is
         readable): events queued by a previous dispatch would otherwise sit
-        unprocessed until the deadline expires.
+        unprocessed until the deadline expires. A dead connection (DISCONNECT
+        event or failed dispatch) makes the wait fail immediately so the
+        caller takes the reconnect path.
         """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            if self._connection_dead:
+                return False
             if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
                 return True
             ei_fd = _get_libei().ei_get_fd(self._ei)
@@ -604,6 +729,7 @@ class EISClient:
             if readable:
                 ret = _get_libei().ei_dispatch(self._ei)
                 if ret < 0:
+                    self._connection_dead = True
                     return False
             while True:
                 event = _get_libei().ei_get_event(self._ei)
@@ -619,10 +745,23 @@ class EISClient:
         KWin pauses EIS devices (e.g. after the client presses a modifier)
         without resuming them; a fresh connectToEIS restores the session
         (adopted from 01SW/kwin-mcp).
+
+        The old EI context is unreferenced here, so all libei objects
+        belonging to it (device handles, active touch sequences) are stale
+        afterwards: touches are finished and dropped, devices and the
+        context are unref'd, bookkeeping is reset.
         """
         with contextlib.suppress(dbus.DBusException):
             if self._eis_iface and self._cookie:
                 self._eis_iface.disconnect(dbus.Int32(self._cookie))
+        # Active touches hold pointers into the old EI context — they must be
+        # finished before the context is unref'd, or touch_motion/touch_up on
+        # a stale touch would use freed memory (use-after-free, A3).
+        for touch in self._active_touches.values():
+            _get_libei().ei_touch_up(touch)
+            _get_libei().ei_touch_unref(touch)
+        self._active_touches.clear()
+        self._next_touch_id = 0
         for attr in ("_touch_device", "_text_device", "_pointer", "_keyboard"):
             existing = getattr(self, attr)
             if existing:
@@ -633,6 +772,7 @@ class EISClient:
         if self._ei:
             _get_libei().ei_unref(self._ei)
             self._ei = 0
+        self._connection_dead = False
         self._setup()
 
     def _flush(self) -> None:
@@ -640,9 +780,14 @@ class EISClient:
 
         Draining processes device pause/resume/remove events so our
         emulation bookkeeping stays in sync with the server between
-        injections.
+        injections. A negative ``ei_dispatch`` return (dead socket without a
+        DISCONNECT event) marks the connection dead instead of being
+        ignored — the next injection's readiness check then rebuilds the
+        connection instead of sending into a void forever (B3).
         """
-        _get_libei().ei_dispatch(self._ei)
+        if _get_libei().ei_dispatch(self._ei) < 0:
+            self._connection_dead = True
+            return
         while True:
             event = _get_libei().ei_get_event(self._ei)
             if not event:

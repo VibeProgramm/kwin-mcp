@@ -10,7 +10,8 @@ after modifier presses. The client must therefore:
 - wait for pointer + keyboard to be emulating before every injection
   (``_ensure_devices_ready``),
 - rebuild the whole EIS connection when the compositor stalls without
-  resuming (``_reconnect``).
+  resuming (``_reconnect``), including releasing active touches and
+  bookkeeping so stale pointers cannot be used afterwards.
 
 The fake libei below follows the same pattern as test_input_resumed.py:
 device pointers are plain ints, events are queued (type, device) tuples and
@@ -20,9 +21,10 @@ real file descriptor.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 import kwin_mcp.input as input_module
 from kwin_mcp.input import (
@@ -32,6 +34,8 @@ from kwin_mcp.input import (
     _EI_EVENT_DEVICE_PAUSED,
     _EI_EVENT_DEVICE_REMOVED,
     _EI_EVENT_DEVICE_RESUMED,
+    _EI_EVENT_DISCONNECT,
+    _EI_EVENT_SEAT_REMOVED,
     _PRESSED,
     _RELEASED,
     EISClient,
@@ -45,7 +49,7 @@ COOKIE = 7
 
 
 class FakeLibei:
-    """Minimal libei stub covering device lifecycle calls and key injection."""
+    """Minimal libei stub covering device lifecycle calls and injection."""
 
     def __init__(
         self,
@@ -56,18 +60,25 @@ class FakeLibei:
         self._event_meta: dict[int, tuple[int, int]] = {}
         self._next_id = 0
         self.device_caps = device_caps
+        self.dispatch_result = 0  # ei_dispatch return value (negative = failure)
         self.started: list[tuple[int, int]] = []  # (device, sequence)
         self.stopped: list[int] = []
         self.unrefed_devices: list[int] = []
         self.unrefed_ei: list[int] = []
+        self.unrefed_touches: list[int] = []
         self.key_calls: list[tuple[int, int]] = []  # (keycode, state)
+        self.button_calls: list[tuple[int, int]] = []
         self.frames: list[int] = []  # device per frame call
+        self.setup_fds: list[int] = []  # fds handed to ei_setup_backend_fd
+        self.touch_downs: list[tuple[int, float, float]] = []
+        self.touch_motions: list[tuple[int, float, float]] = []
+        self.touch_ups: list[int] = []
 
     def ei_get_fd(self, ei: int) -> int:
         return 9
 
     def ei_dispatch(self, ei: int) -> int:
-        return 0
+        return self.dispatch_result
 
     def ei_get_event(self, ei: int) -> int:
         if not self._events:
@@ -106,8 +117,61 @@ class FakeLibei:
     def ei_device_keyboard_key(self, device: int, keycode: int, state: int) -> None:
         self.key_calls.append((keycode, state))
 
+    def ei_device_button_button(self, device: int, button: int, state: int) -> None:
+        self.button_calls.append((button, state))
+
+    def ei_device_pointer_motion_absolute(self, device: int, x: float, y: float) -> None:
+        return None
+
     def ei_device_frame(self, device: int, time_us: int) -> None:
         self.frames.append(device)
+
+    def ei_device_touch_new(self, device: int) -> int:
+        return 0x900 + len(self.touch_downs)
+
+    def ei_touch_down(self, touch: int, x: float, y: float) -> None:
+        self.touch_downs.append((touch, x, y))
+
+    def ei_touch_motion(self, touch: int, x: float, y: float) -> None:
+        self.touch_motions.append((touch, x, y))
+
+    def ei_touch_up(self, touch: int) -> None:
+        self.touch_ups.append(touch)
+
+    def ei_touch_unref(self, touch: int) -> None:
+        self.unrefed_touches.append(touch)
+
+    # Connection-setup calls exercised by the real-_setup tests (B5).
+    def ei_configure_name(self, ei: int, name: bytes) -> None:
+        return None
+
+    def ei_setup_backend_fd(self, ei: int, fd: int) -> int:
+        self.setup_fds.append(fd)
+        return 0
+
+
+class SwitchingLibei:
+    """libei router handing each new EI context (ei_new_sender) its own fake.
+
+    Used by the real-``_setup`` reconnect tests: the stale connection's fake
+    serves nothing, the fresh connection's fake serves the handshake events.
+    """
+
+    def __init__(self, fakes: list[FakeLibei]) -> None:
+        self._fakes = fakes
+        self._index = 0
+
+    @property
+    def current(self) -> FakeLibei:
+        return self._fakes[self._index]
+
+    def ei_new_sender(self, _arg: int) -> int:
+        if self._index < len(self._fakes) - 1:
+            self._index += 1
+        return 100 + self._index
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.current, name)
 
 
 class FakeClock:
@@ -132,6 +196,33 @@ class FakeIface:
         self.disconnected.append(int(cookie))
 
 
+class FakeFd:
+    """D-Bus unixfd stub for the real-_setup tests."""
+
+    def take(self) -> int:
+        return 11
+
+
+class FakeRemoteDesktopIface:
+    """D-Bus EIS interface stub used by real-_setup tests (connectToEIS)."""
+
+    def __init__(self) -> None:
+        self.disconnected: list[int] = []
+
+    def connectToEIS(self, caps: int) -> tuple[FakeFd, int]:  # noqa: N802
+        return (FakeFd(), 42)
+
+    def disconnect(self, cookie: int) -> None:
+        self.disconnected.append(int(cookie))
+
+
+class FakeBus:
+    """BusConnection stub whose get_object always succeeds."""
+
+    def get_object(self, *_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+
 def _client(fake: FakeLibei) -> EISClient:
     """An EISClient that skipped __init__ (no D-Bus, no libei load)."""
     client = EISClient.__new__(EISClient)
@@ -143,6 +234,8 @@ def _client(fake: FakeLibei) -> EISClient:
     client._sequence = 0
     client._emulating_devices = {POINTER, KEYBOARD}
     client._active_touches = {}
+    client._next_touch_id = 0
+    client._connection_dead = False
     client._eis_iface = None
     client._cookie = 0
     return client
@@ -206,6 +299,27 @@ def test_wait_emulating_times_out_when_never_resumed(monkeypatch) -> None:
     assert fake.started == []
 
 
+def test_resume_device_is_idempotent_on_duplicate_resumed(monkeypatch) -> None:
+    """A duplicate RESUMED for an emulating device must not restart emulation.
+
+    Regression for B7: the second RESUMED used to call start_emulating again
+    (with a burned sequence number), diverging from _pause_device's
+    symmetric bookkeeping.
+    """
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_RESUMED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._emulating_devices = set()
+
+    client._wait_emulating(0.5)
+
+    assert fake.started == [(POINTER, 1)]
+    assert client._sequence == 1
+
+
 def test_ensure_devices_ready_recovers_after_pause(monkeypatch) -> None:
     """pause → RESUMED in the queue → injection proceeds without reconnect."""
     fake = FakeLibei(
@@ -248,18 +362,166 @@ def test_ensure_devices_ready_reconnects_on_stall(monkeypatch) -> None:
     assert client._sequence == 0
 
 
-def test_ensure_devices_ready_raises_after_failed_reconnect(monkeypatch) -> None:
-    """Stall persists even after reconnecting → RuntimeError."""
-    fake = FakeLibei([], {})
+def test_ensure_devices_ready_reconnects_after_unresumed_pause(monkeypatch) -> None:
+    """PAUSED drained mid-session without a queued RESUMED → next call rebuilds.
+
+    Covers the B6 reconnect path: _pause_device discards the device from the
+    emulating set, so the next injection's readiness wait stalls and takes
+    the reconnect branch.
+    """
+    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
     client = _client(fake)
-    client._emulating_devices = set()
-    client._setup, setup_calls = _reconnecting_setup(client, emulating=False)
-    # Fast-forward both waits (0.05s + the post-reconnect 3.0s) via a fake clock.
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
+
+    client.pointer_button(0x110, _PRESSED)  # injection drains the PAUSED event
+    assert client._emulating_devices == {KEYBOARD}
+
+    client._ensure_devices_ready(timeout_s=0.05)  # next injection recovers
+    assert setup_calls == [1]
+
+
+def test_ensure_devices_ready_reconnect_runs_real_negotiation(monkeypatch) -> None:
+    """Stall → reconnect with the REAL _setup/_negotiate_devices → success.
+
+    Regression for B5(c): only the D-Bus plumbing is faked; the actual
+    negotiation (ADDED → RESUMED → start_emulating) runs against the fake
+    libei of the fresh connection.
+    """
+    stale = FakeLibei(
+        [],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    fresh = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    router = SwitchingLibei([stale, fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+
+    client = _client(stale)
+    client._emulating_devices = set()  # stalled: paused, no resume queued
+    client._bus = FakeBus()
+
+    client._ensure_devices_ready(timeout_s=0.05)
+
+    assert client._pointer == NEW_POINTER
+    assert client._keyboard == NEW_KEYBOARD
+    assert client._emulating_devices == {NEW_POINTER, NEW_KEYBOARD}
+    assert fresh.setup_fds == [11]
+    assert sorted(device for device, _ in fresh.started) == sorted([NEW_POINTER, NEW_KEYBOARD])
+    # The stale connection was fully released before the fresh one.
+    assert stale.unrefed_ei == [1]
+
+
+def test_ensure_devices_ready_reconnect_failure_raises_tool_error(monkeypatch) -> None:
+    """Reconnect whose negotiation never completes → ToolError, clean state.
+
+    Regression for B5(a)/(c) + B10: the real _negotiate_devices runs against
+    a fresh connection whose keyboard never resumes → the partial handshake
+    is torn down (slots 0, EI context 0, started device stopped) and the
+    failure surfaces as ToolError("EIS reconnect failed: ...") instead of a
+    bare RuntimeError.
+    """
+    stale = FakeLibei(
+        [],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    fresh = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    router = SwitchingLibei([stale, fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+    # Fast-forward the readiness wait and the 5s negotiation deadline.
     monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
 
-    with pytest.raises(RuntimeError, match="not in emulating state"):
+    client = _client(stale)
+    client._emulating_devices = set()
+    client._bus = FakeBus()
+
+    with pytest.raises(ToolError, match="EIS reconnect failed"):
         client._ensure_devices_ready(timeout_s=0.05)
+
+    # Nothing left dangling from the failed (partial) negotiation.
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    assert client._ei == 0
+    assert client._emulating_devices == set()
+    assert NEW_POINTER in fresh.stopped  # the started device was stopped
+    assert set(fresh.unrefed_devices) == {NEW_POINTER, NEW_KEYBOARD}
+    assert fresh.unrefed_ei == [101]
+
+
+def test_disconnect_event_flags_dead_connection_instead_of_raising(monkeypatch) -> None:
+    """DISCONNECT during a drain must not raise; the NEXT injection rebuilds.
+
+    Regression for B3: _handle_event used to raise RuntimeError straight out
+    of the drain loop, bypassing the reconnect path entirely.
+    """
+    fake = FakeLibei([(_EI_EVENT_DISCONNECT, 0)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
+
+    client.keyboard_key(30, _PRESSED)  # flush drains the DISCONNECT event
+    assert client._connection_dead is True  # flagged, not raised
+    assert fake.key_calls == [(30, _PRESSED)]
+
+    client.keyboard_key(31, _PRESSED)  # readiness wait sees dead → reconnect
+    assert setup_calls == [1]
+    assert fake.key_calls == [(30, _PRESSED), (31, _PRESSED)]
+
+
+def test_dispatch_failure_triggers_reconnect_on_next_injection(monkeypatch) -> None:
+    """ei_dispatch() < 0 (dead socket, no DISCONNECT event) → reconnect path.
+
+    Regression for B3(a): the negative return used to be ignored, leaving the
+    client "emulating" forever and injecting into a void.
+    """
+    fake = FakeLibei([], {})
+    fake.dispatch_result = -1
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
+
+    client.keyboard_key(30, _PRESSED)  # flush marks the connection dead
+    assert client._connection_dead is True
+
+    client.keyboard_key(31, _PRESSED)  # next injection rebuilds the connection
+    assert setup_calls == [1]
+    assert fake.key_calls == [(30, _PRESSED), (31, _PRESSED)]
+
+
+def test_seat_removed_drops_all_devices(monkeypatch) -> None:
+    """SEAT_REMOVED → every device slot dropped and unref'd (B9)."""
+    fake = FakeLibei([(_EI_EVENT_SEAT_REMOVED, 0)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    client._flush()
+
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    assert client._emulating_devices == set()
+    assert sorted(fake.unrefed_devices) == sorted([KEYBOARD, POINTER])
+
+    # The next injection sees no devices at all and takes the reconnect path.
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
+    client._ensure_devices_ready(timeout_s=0.05)
     assert setup_calls == [1]
 
 
@@ -275,8 +537,12 @@ def test_flush_processes_pause_event(monkeypatch) -> None:
     assert client._emulating_devices == {KEYBOARD}
 
 
-def test_flush_replaces_readded_device(monkeypatch) -> None:
-    """A re-advertised device replaces the stale reference and unrefs it."""
+def test_flush_does_not_steal_slot_from_emulating_device(monkeypatch) -> None:
+    """ADDED(B) while A is still emulating → slot keeps A; B must not be unref'd.
+
+    Regression for B4: every DEVICE_ADDED used to replace the slot, so a
+    second device of the same capability unref'd a working device mid-flight.
+    """
     fake = FakeLibei(
         [(_EI_EVENT_DEVICE_ADDED, NEW_POINTER)],
         {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}},
@@ -286,10 +552,39 @@ def test_flush_replaces_readded_device(monkeypatch) -> None:
 
     client._flush()
 
+    assert client._pointer == POINTER
+    assert fake.unrefed_devices == []
+
+
+def test_flush_replaces_paused_device_slot(monkeypatch) -> None:
+    """A paused (non-emulating) device may be replaced by a re-advertised one."""
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_ADDED, NEW_POINTER)],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._emulating_devices = {KEYBOARD}  # POINTER currently paused
+
+    client._flush()
+
     assert client._pointer == NEW_POINTER
     assert fake.unrefed_devices == [POINTER]
-    assert POINTER not in client._emulating_devices
-    assert NEW_POINTER not in client._emulating_devices  # not resumed yet
+
+
+def test_flush_fills_slot_after_removal(monkeypatch) -> None:
+    """REMOVED(A) then ADDED(B) → slot B (the original remove/re-add burst)."""
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_REMOVED, POINTER), (_EI_EVENT_DEVICE_ADDED, NEW_POINTER)],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    client._flush()
+
+    assert client._pointer == NEW_POINTER
+    assert fake.unrefed_devices == [POINTER]
 
 
 def test_flush_processes_removed_device(monkeypatch) -> None:
@@ -303,6 +598,40 @@ def test_flush_processes_removed_device(monkeypatch) -> None:
     assert client._keyboard == 0
     assert fake.unrefed_devices == [KEYBOARD]
     assert client._emulating_devices == {POINTER}
+
+
+def test_reconnect_releases_active_touches(monkeypatch) -> None:
+    """Reconnect finishes active touches and resets IDs; stale IDs are safe.
+
+    Regression for A3: active touch pointers referenced the unref'd EI
+    context, so touch_motion/touch_up after a reconnect was a use-after-free.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._active_touches = {5: 0x777}
+    client._next_touch_id = 6
+    client._eis_iface = FakeIface()
+    client._cookie = COOKIE
+    client._setup, _setup_calls = _reconnecting_setup(client, emulating=True)
+
+    client._reconnect()
+
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
+    assert fake.unrefed_touches == [0x777]
+
+    # A stale touch id is rejected instead of touching the dead pointer.
+    with pytest.raises(ValueError, match="No active touch"):
+        client.touch_move(5, 1.0, 1.0)
+
+    # Fresh gestures work again from ID 0 on the new connection.
+    touch_id = client.touch_down(10.0, 20.0)
+    assert touch_id == 0
+    client.touch_move(touch_id, 11.0, 21.0)
+    client.touch_up(touch_id)
+    # touch_ups = [stale 0x777 (finished by the reconnect), new gesture touch]
+    assert fake.touch_ups == [0x777, fake.touch_downs[0][0]]
 
 
 def test_reconnect_unrefs_old_state(monkeypatch) -> None:
@@ -405,13 +734,3 @@ def test_client_state_fields_exist(monkeypatch) -> None:
     assert client._device_emulating(POINTER) is True
     assert client._device_emulating(0) is False
     assert client._device_emulating(0x999) is False
-
-
-def test_reconnect_stub_accepts_namespace(monkeypatch) -> None:
-    """Sanity: the fake _setup mechanism used above behaves as expected."""
-    client = _client(FakeLibei([], {}))
-    client._setup, calls = _reconnecting_setup(client, emulating=True)
-    assert isinstance(calls, list)
-    client._setup()
-    assert calls == [1]
-    assert isinstance(SimpleNamespace, type)  # placeholder guard for imports

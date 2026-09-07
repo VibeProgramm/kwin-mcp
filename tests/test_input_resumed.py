@@ -46,6 +46,9 @@ class FakeLibei:
         self._next_id = 0
         self.device_caps = device_caps
         self.started: list[int] = []
+        self.stopped: list[int] = []
+        self.unrefed_devices: list[int] = []
+        self.unrefed_ei: list[int] = []
 
     def ei_get_fd(self, ei: int) -> int:
         return 9
@@ -75,8 +78,17 @@ class FakeLibei:
     def ei_device_ref(self, device: int) -> int:
         return device
 
+    def ei_device_unref(self, device: int) -> None:
+        self.unrefed_devices.append(device)
+
     def ei_device_start_emulating(self, device: int, sequence: int) -> None:
         self.started.append(device)
+
+    def ei_device_stop_emulating(self, device: int) -> None:
+        self.stopped.append(device)
+
+    def ei_unref(self, ei: int) -> None:
+        self.unrefed_ei.append(ei)
 
 
 def _client() -> EISClient:
@@ -89,6 +101,11 @@ def _client() -> EISClient:
     client._text_device = 0
     client._sequence = 0
     client._emulating_devices = set()
+    client._active_touches = {}
+    client._next_touch_id = 0
+    client._connection_dead = False
+    client._eis_iface = None
+    client._cookie = 0
     return client
 
 
@@ -150,3 +167,38 @@ def test_negotiate_times_out_when_keyboard_never_resumes(monkeypatch) -> None:
     with pytest.raises(ToolError, match="resum"):
         client._negotiate_devices(timeout=0.1)
     assert KEYBOARD not in fake.started
+
+
+def test_partial_handshake_failure_leaves_clean_state(monkeypatch) -> None:
+    """Negotiation failure tears down the half-initialized connection.
+
+    Regression for B10: a partial fail (pointer emulating, keyboard never)
+    used to leak the started pointer, both device refs and the live EI
+    context. Now the fail path stops what started, unrefs devices + context
+    and resets every slot to 0 before ToolError propagates.
+    """
+    caps = {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}}
+    events = [
+        (_EI_EVENT_DEVICE_ADDED, POINTER),
+        (_EI_EVENT_DEVICE_ADDED, KEYBOARD),
+        (_EI_EVENT_DEVICE_RESUMED, POINTER),
+    ]
+    fake = FakeLibei(events, caps)
+    _install(monkeypatch, fake)
+
+    client = _client()
+    with pytest.raises(ToolError, match="resum"):
+        client._negotiate_devices(timeout=0.1)
+
+    # No dangling state: slots zeroed, EI context released, bookkeeping reset.
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    assert client._touch_device == 0
+    assert client._text_device == 0
+    assert client._ei == 0
+    assert client._emulating_devices == set()
+    assert client._sequence == 0
+    # The device that started emulating was stopped before release.
+    assert POINTER in fake.stopped
+    assert sorted(fake.unrefed_devices) == sorted([KEYBOARD, POINTER])
+    assert fake.unrefed_ei == [1]
