@@ -175,9 +175,7 @@ def test_detect_kscreen_doctor_combined_flags_line(monkeypatch) -> None:
         core_module.subprocess,
         "run",
         lambda *a, **k: _run_result(
-            "Output: 1 DP-1\n"
-            "enabled connected priority 1\n"
-            "Geometry: 0,0 1920x1080\n"
+            "Output: 1 DP-1\nenabled connected priority 1\nGeometry: 0,0 1920x1080\n"
         ),
     )
     assert _detect_physical_screen_size() == (1920, 1080)

@@ -1048,7 +1048,6 @@ def test_wait_emulating_require_text_device(monkeypatch: Any) -> None:
     Regression for the review finding: text injections gated only on
     pointer + keyboard, so a paused text device silently dropped input.
     """
-    from kwin_mcp.input import _EI_CAP_TEXT
 
     fake = FakeLibei([], {})
     _install(monkeypatch, fake)
