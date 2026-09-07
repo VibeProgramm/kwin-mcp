@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 
 @dataclass
@@ -61,6 +62,17 @@ _GEOM_SCRIPT_TEMPLATE = """try {
 """
 
 _cache: dict[str, tuple[float, list[WindowGeometry]]] = {}
+
+
+def _parse_coord(value: str) -> int:
+    """Parse one KWin geometry component into device pixels.
+
+    Under fractional scaling KWin reports subpixel (fractional) values such
+    as ``601.8031365528899``. They are rounded half-up (ties away from zero)
+    to the nearest device pixel; plain truncation would shift the reported
+    window origin by up to a pixel and misplace translated clicks.
+    """
+    return int(Decimal(value.strip()).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def get_window_geometries(dbus_address: str = "") -> list[WindowGeometry]:
@@ -225,11 +237,11 @@ def _parse_payload(payload: str) -> list[WindowGeometry]:
             continue
         caption, frame_s, client_s, resource_class = fields
         try:
-            frame = [int(v) for v in frame_s.split(",")]
-            client = [int(v) for v in client_s.split(",")]
+            frame = [_parse_coord(v) for v in frame_s.split(",")]
+            client = [_parse_coord(v) for v in client_s.split(",")]
             if len(frame) != 4 or len(client) != 4:
                 continue
-        except ValueError:
+        except (ValueError, InvalidOperation):
             continue
         geometries.append(
             WindowGeometry(
