@@ -432,6 +432,41 @@ uv run kwin-mcp
 - **Screen edge triggers do not work with EIS input** -- Auto-hide panels and layer-shell trigger strips rely on Wayland surface input routing, which may not respond to EIS-injected pointer events. Workaround: use `dbus_call` with KWin scripting or keyboard shortcuts instead.
 - **AT-SPI2 coordinate translation is best-effort** -- Wayland clients report window-local coordinates (they do not know their global screen position by design). kwin-mcp translates them to true screen coordinates using each window's compositor-side geometry (queried from KWin scripting, matched by caption). If a window cannot be matched, its coordinates fall back to window-local -- cross-reference with `screenshot` to disambiguate.
 
+## Troubleshooting & Debugging
+
+### Verbose libei/EIS diagnostics (`KWIN_MCP_DEBUG_EI=1`)
+
+Set the environment variable `KWIN_MCP_DEBUG_EI=1` to enable verbose
+diagnostics for the EIS input injection path (kwin-mcp's direct libei
+connection to KWin):
+
+```bash
+KWIN_MCP_DEBUG_EI=1 uv run kwin-mcp
+```
+
+When enabled, the `kwin_mcp.input` logger is raised to `DEBUG` level with a
+stderr handler and logs EIS device lifecycle events
+(ADDED / REMOVED / RESUMED / PAUSED / SEAT_REMOVED), device stalls, and
+connection rebuilds. Use it when input injection silently does nothing or
+behaves erratically: the log shows whether KWin is pausing/removing its EIS
+devices around input bursts and whether kwin-mcp manages to rebuild the
+connection.
+
+```bash
+KWIN_MCP_DEBUG_EI=1 uv run kwin-mcp 2>eis-debug.log
+```
+
+### Other symptoms
+
+- **No input backend available** in `session_start` output — KWin did not
+  expose its EIS RemoteDesktop interface; the session degrades to a
+  screenshot/AT-SPI2-only session (no injection). Check the KWin version
+  (Plasma 6 required) and the server log for the degradation reason.
+- **`keyboard_type_unicode` fails in virtual sessions** — `kwin_wayland
+  --virtual` does not expose the virtual-keyboard protocol `wtype` needs;
+  the clipboard fallback (requires `wl-clipboard`) is the primary path
+  there.
+
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style guidelines, and the pull request process.
