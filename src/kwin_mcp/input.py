@@ -1364,6 +1364,76 @@ class EISClient:
             self._held_keys.update(held_before)
             raise
 
+    def claim_transient_hold(
+        self, keys: list[int], buttons: list[int]
+    ) -> tuple[frozenset[int], frozenset[int]]:
+        """Register operation-scoped transient presses as temporary held intents.
+
+        Composite operations (``InputBackend.mouse_click`` modifiers,
+        ``InputBackend.mouse_drag`` modifiers + drag button) send presses
+        whose release belongs to the same call. Such transient presses used
+        to bypass the held sets, so a PAUSED/reconnect recovery
+        mid-operation silently dropped them while the operation continued:
+        the click landed without its modifier and the drag degraded to a
+        button-less motion (issue #20). Registered here, a mid-operation
+        recovery replays them through the production ``_replay_held_state``
+        path and the operation completes with modifiers/button intact.
+
+        The intents are recorded BEFORE the operation's press frames go out
+        (issue #19 ordering): a PAUSED→RESUMED drained by the press frame's
+        own post-send ``_flush`` must already see them, or the replay misses
+        the same-call recovery. ``drop_transient_hold`` releases them; both
+        methods send nothing themselves.
+
+        Pre-existing membership (a modifier the agent holds across calls via
+        ``keyboard_key_down``) is remembered in the return value and never
+        stolen: the drop removes only what this claim added.
+
+        Args:
+            keys: Evdev keycodes to hold transiently (modifier DOWN set).
+            buttons: Evdev button codes to hold transiently (drag button).
+
+        Returns:
+            The (key, button) codes that were already held before this
+            claim, to hand back to ``drop_transient_hold``.
+        """
+        pre_keys = frozenset(keys) & self._held_keys
+        pre_buttons = frozenset(buttons) & self._held_buttons
+        self._held_keys.update(keys)
+        self._held_buttons.update(buttons)
+        return (pre_keys, pre_buttons)
+
+    def drop_transient_hold(
+        self,
+        keys: list[int],
+        buttons: list[int],
+        pre: tuple[frozenset[int], frozenset[int]],
+    ) -> None:
+        """Release operation-scoped transient intents, keeping other holds.
+
+        Pairing half of ``claim_transient_hold``: drops only the codes this
+        claim added. Pre-existing holds (remembered in ``pre``) were never
+        removed by the claim and stay exactly as the recovery path left
+        them — in particular a reconnect-budget exhaustion that cleared the
+        sets mid-operation (with its "re-press if needed" ToolError) is not
+        undone here.
+
+        Called BEFORE the operation's release frames go out (issue #19
+        release ordering): a PAUSED→RESUMED drained by the release frame's
+        own ``_flush`` must find nothing transient to re-press, or the wire
+        ends DOWN-after-UP (sticky modifier). Idempotent: safe to call again
+        on the operation's failure path after the success path already
+        dropped.
+
+        Sends nothing itself; a release frame whose delivery fails
+        (ToolError) still ends the operation scope, so the transient intents
+        stay dropped instead of leaking into the next handshake's replay as
+        phantom holds.
+        """
+        pre_keys, pre_buttons = pre
+        self._held_keys.difference_update(set(keys) - pre_keys)
+        self._held_buttons.difference_update(set(buttons) - pre_buttons)
+
     def text_keysym(self, keysym: int, state: int) -> None:
         """Press/release a key by XKB keysym via the EIS text device.
 
@@ -1526,6 +1596,15 @@ class InputBackend:
     ) -> None:
         """Click at the given coordinates.
 
+        Recovery semantics (issue #20): transient modifiers are registered
+        as temporary held state for the operation duration, so an EIS
+        recovery (PAUSED/reconnect) mid-click replays them through the
+        production held-state path and the click lands WITH its modifiers.
+        The sets are empty again afterwards; a mid-operation
+        reconnect-budget exhaustion still aborts loudly with its own
+        "re-press if needed" ToolError instead of a silent modifier-less
+        click.
+
         Args:
             x, y: Coordinates to click at.
             button: Mouse button to use.
@@ -1546,18 +1625,25 @@ class InputBackend:
         # Batch modifier presses into one frame: a combo spread over several
         # frames lets KWin pause the keyboard device mid-press and drop the
         # remaining strokes (same rationale as keyboard_burst for key combos).
-        if mod_codes:
-            self._client.keyboard_burst([(mod, _PRESSED) for mod in mod_codes])
+        pre = self._client.claim_transient_hold(mod_codes, [])
+        try:
+            if mod_codes:
+                self._client.keyboard_burst([(mod, _PRESSED) for mod in mod_codes])
 
-        for i in range(click_count):
-            if i > 0:
-                time.sleep(0.05)
-            self._client.pointer_button(btn_code, _PRESSED)
-            if hold_ms > 0 and i == click_count - 1:
-                time.sleep(max(0.01, hold_ms / 1000.0))
-            else:
-                time.sleep(0.01)
-            self._client.pointer_button(btn_code, _RELEASED)
+            for i in range(click_count):
+                if i > 0:
+                    time.sleep(0.05)
+                self._client.pointer_button(btn_code, _PRESSED)
+                if hold_ms > 0 and i == click_count - 1:
+                    time.sleep(max(0.01, hold_ms / 1000.0))
+                else:
+                    time.sleep(0.01)
+                self._client.pointer_button(btn_code, _RELEASED)
+        finally:
+            # Drop BEFORE the release frame (issue #19 release ordering): a
+            # PAUSED→RESUMED drained by the release's own post-send _flush
+            # must find nothing transient to re-press (sticky modifier).
+            self._client.drop_transient_hold(mod_codes, [], pre)
 
         # Release modifier keys in reverse order, again as a single frame.
         if mod_codes:
@@ -1623,6 +1709,15 @@ class InputBackend:
     ) -> None:
         """Drag from one point to another.
 
+        Recovery semantics (issue #20): transient modifiers and the drag
+        button are registered as temporary held state for the operation
+        duration, so an EIS recovery (PAUSED/reconnect) mid-drag replays
+        them through the production held-state path — the motion frames run
+        with the button logically down, never as a button-less motion. The
+        sets are empty again afterwards; a mid-operation reconnect-budget
+        exhaustion still aborts loudly with its own "re-press if needed"
+        ToolError instead of a silent modifier-less drag.
+
         Args:
             from_x, from_y: Starting coordinates.
             to_x, to_y: Ending coordinates.
@@ -1638,36 +1733,43 @@ class InputBackend:
 
         # Batch modifier presses into one frame (same rationale as in
         # mouse_click: KWin may pause mid-press otherwise).
-        if mod_codes:
-            self._client.keyboard_burst([(mod, _PRESSED) for mod in mod_codes])
+        pre = self._client.claim_transient_hold(mod_codes, [btn_code])
+        try:
+            if mod_codes:
+                self._client.keyboard_burst([(mod, _PRESSED) for mod in mod_codes])
 
-        self._client.pointer_button(btn_code, _PRESSED)
-        time.sleep(0.02)
+            self._client.pointer_button(btn_code, _PRESSED)
+            time.sleep(0.02)
 
-        # Build full path: start -> waypoints -> end
-        segments: list[tuple[int, int, int, int, int]] = []  # (fx, fy, tx, ty, dwell_ms)
-        prev_x, prev_y = from_x, from_y
-        if waypoints:
-            for wx, wy, dwell_ms in waypoints:
-                segments.append((prev_x, prev_y, wx, wy, dwell_ms))
-                prev_x, prev_y = wx, wy
-        segments.append((prev_x, prev_y, to_x, to_y, 0))
+            # Build full path: start -> waypoints -> end
+            segments: list[tuple[int, int, int, int, int]] = []  # (fx, fy, tx, ty, dwell_ms)
+            prev_x, prev_y = from_x, from_y
+            if waypoints:
+                for wx, wy, dwell_ms in waypoints:
+                    segments.append((prev_x, prev_y, wx, wy, dwell_ms))
+                    prev_x, prev_y = wx, wy
+            segments.append((prev_x, prev_y, to_x, to_y, 0))
 
-        for seg_fx, seg_fy, seg_tx, seg_ty, dwell_ms in segments:
-            dx = seg_tx - seg_fx
-            dy = seg_ty - seg_fy
-            steps = max(10, int((dx**2 + dy**2) ** 0.5 / 10))
-            for i in range(1, steps + 1):
-                frac = i / steps
-                cx = seg_fx + dx * frac
-                cy = seg_fy + dy * frac
-                self._client.pointer_move_absolute(cx, cy)
-                time.sleep(0.01)
-            if dwell_ms > 0:
-                time.sleep(dwell_ms / 1000.0)
+            for seg_fx, seg_fy, seg_tx, seg_ty, dwell_ms in segments:
+                dx = seg_tx - seg_fx
+                dy = seg_ty - seg_fy
+                steps = max(10, int((dx**2 + dy**2) ** 0.5 / 10))
+                for i in range(1, steps + 1):
+                    frac = i / steps
+                    cx = seg_fx + dx * frac
+                    cy = seg_fy + dy * frac
+                    self._client.pointer_move_absolute(cx, cy)
+                    time.sleep(0.01)
+                if dwell_ms > 0:
+                    time.sleep(dwell_ms / 1000.0)
 
-        time.sleep(0.02)
-        self._client.pointer_button(btn_code, _RELEASED)
+            time.sleep(0.02)
+            self._client.pointer_button(btn_code, _RELEASED)
+        finally:
+            # Drop BEFORE the modifier release frame (issue #19 release
+            # ordering): a PAUSED→RESUMED drained by the release's own
+            # post-send _flush must find nothing transient to re-press.
+            self._client.drop_transient_hold(mod_codes, [btn_code], pre)
 
         # Release modifier keys in reverse order, again as a single frame.
         if mod_codes:
