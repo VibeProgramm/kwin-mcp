@@ -521,16 +521,20 @@ class EISClient:
         disconnect, dead socket on the touch cleanup touch_up), so a cleanup
         failure can never abort the teardown halfway and leak devices, the
         EI context or a live D-Bus cookie. Used by the handshake failure
-        path and by ``_reconnect`` (F3: the rebuild must be as defensive as
-        the handshake teardown, not a less-guarded duplicate of it).
+        path, by ``_reconnect`` (F3: the rebuild must be as defensive as
+        the handshake teardown, not a less-guarded duplicate of it) and by
+        ``close`` (issue #16, round 2: one shared implementation, so the
+        ownership model cannot drift between the teardown and the close).
 
-        One multi-capability handle may occupy several slots
-        (``_register_device`` puts it into every matching one, issue #16
-        F2): the slots are cleared first, then each UNIQUE handle is
-        stopped/unref'd once — a per-slot unref would release a live handle
-        several times. Every per-device step and the context release are
+        Ownership is per slot (issue #16, round 2): ``_register_device``
+        takes one ``ei_device_ref`` for every slot a handle occupies, so
+        every cleared slot releases its own ``ei_device_unref`` here — no
+        unique-handle dedup, which would under-release multi-slot handles.
+        Emulation state is per handle instead (``_emulating_devices`` is a
+        set): a shared handle stops emulating once, then each of its slots
+        unrefs. Every per-device step and the context release are
         individually suppressed (issue #16, F4): a failing
-        ``stop_emulating``/``unref`` must not skip the remaining handles or
+        ``stop_emulating``/``unref`` must not skip the remaining slots or
         the context reset below.
         """
         with contextlib.suppress(dbus.DBusException):
@@ -540,17 +544,19 @@ class EISClient:
         # cookie must not leak into the fresh handshake after a rebuild.
         self._cookie = 0
         self._invalidate_touches()
-        devices = [getattr(self, attr) for attr in _DEVICE_ATTRS]
         for attr in _DEVICE_ATTRS:
+            device = getattr(self, attr)
             setattr(self, attr, 0)
-        for device in dict.fromkeys(devices):
             if not device:
                 continue
-            # Started devices must stop emulating before release.
+            # Started devices must stop emulating before release (once per
+            # handle: the set discard makes the second slot of a shared
+            # handle skip the stop).
             if device in self._emulating_devices:
                 with contextlib.suppress(Exception):
                     _get_libei().ei_device_stop_emulating(device)
             self._emulating_devices.discard(device)
+            # Per-slot ownership: every cleared slot releases its own ref.
             with contextlib.suppress(Exception):
                 _get_libei().ei_device_unref(device)
         self._emulating_devices.clear()
@@ -704,19 +710,20 @@ class EISClient:
         ``_invalidate_touches`` (F4): their stored pointers must not survive
         the state reset.
 
-        One multi-capability handle may occupy several slots — each unique
-        handle is unref'd once (issue #16, F2).
+        Ownership is per slot (issue #16, round 2): every cleared slot
+        releases its own ``ei_device_unref``, matching the per-slot refs
+        ``_register_device`` took. Each unref is individually suppressed: a
+        failing release must not abort the remaining slots (same guarantee
+        as the ``close`` path, M3).
         """
         _ei_debug("seat removed; dropping all devices")
         self._invalidate_touches()
-        seen: set[int] = set()
         for attr in _DEVICE_ATTRS:
             device = getattr(self, attr)
             if device:
                 self._emulating_devices.discard(device)
                 setattr(self, attr, 0)
-                if device not in seen:
-                    seen.add(device)
+                with contextlib.suppress(Exception):
                     _get_libei().ei_device_unref(device)
         self._emulating_devices.clear()
 
@@ -872,6 +879,13 @@ class EISClient:
         stealing the slot then would unref a working device mid-flight. A
         slot is only switched when it is empty or the old device is paused
         or already removed from the emulation set (B4).
+
+        Ownership is per slot (issue #16, round 2): every slot the handle
+        occupies takes its own ``ei_device_ref`` (see
+        ``_replace_device_ref``), and every release path
+        (``_remove_device``, ``_handle_seat_removed``,
+        ``_teardown_connection``, ``close``) unrefs once per cleared slot,
+        so taken and released refs always balance per handle.
         """
         device = _get_libei().ei_event_get_device(event)
 
@@ -896,6 +910,10 @@ class EISClient:
         Replacement happens only when the slot is empty, or the current
         occupant is no longer usable (not in the emulating set, i.e. paused
         or removed). A live, emulating device keeps its slot.
+
+        The adopting slot takes its own ``ei_device_ref`` (per-slot
+        ownership, issue #16 round 2): evicting this slot later unrefs
+        exactly this ref, so a surviving alias in another slot stays valid.
         """
         old = getattr(self, attr)
         if old == device:
@@ -915,8 +933,9 @@ class EISClient:
         the device state), so dropping the touch device also invalidates the
         active gestures (F4).
 
-        One multi-capability handle may occupy several slots — the unique
-        handle is unref'd once (issue #16, F2).
+        Ownership is per slot (issue #16, round 2): every cleared slot
+        releases its own ``ei_device_unref``, matching the per-slot refs
+        ``_register_device`` took for a multi-capability handle.
         """
         device = _get_libei().ei_event_get_device(event)
         if not device:
@@ -925,14 +944,11 @@ class EISClient:
         # Whether the removed device occupies the touch slot, checked BEFORE
         # the loop clears the slots (comparing after would always see 0).
         was_touch_device = device == self._touch_device
-        matched = False
         for attr in _DEVICE_ATTRS:
             if getattr(self, attr) == device:
                 setattr(self, attr, 0)
                 self._emulating_devices.discard(device)
-                matched = True
-        if matched:
-            _get_libei().ei_device_unref(device)
+                _get_libei().ei_device_unref(device)
         if was_touch_device:
             self._invalidate_touches()
 
@@ -1392,42 +1408,20 @@ class EISClient:
         self._flush()
 
     def close(self) -> None:
-        """Clean up EIS connection."""
-        # Release any lingering touches through the shared helper: on a dead
-        # connection it unrefs + drops without sending touch_up into the
-        # void (issue #16, F6), and per-touch failures never abort the
-        # device cleanup below.
-        self._invalidate_touches()
-        self._emulating_devices.clear()
+        """Clean up EIS connection.
 
-        if self._touch_device and self._touch_device not in (self._pointer, self._keyboard):
-            _get_libei().ei_device_stop_emulating(self._touch_device)
-            _get_libei().ei_device_unref(self._touch_device)
-            self._touch_device = 0
-        if self._text_device and self._text_device not in (
-            self._pointer,
-            self._keyboard,
-            self._touch_device,
-        ):
-            _get_libei().ei_device_stop_emulating(self._text_device)
-            _get_libei().ei_device_unref(self._text_device)
-            self._text_device = 0
-        if self._pointer:
-            _get_libei().ei_device_stop_emulating(self._pointer)
-            _get_libei().ei_device_unref(self._pointer)
-            self._pointer = 0
-        if self._keyboard and self._keyboard != self._pointer:
-            _get_libei().ei_device_stop_emulating(self._keyboard)
-            _get_libei().ei_device_unref(self._keyboard)
-            self._keyboard = 0
-
-        if self._eis_iface and self._cookie:
-            with contextlib.suppress(dbus.DBusException):
-                self._eis_iface.disconnect(dbus.Int32(self._cookie))
-
-        if self._ei:
-            _get_libei().ei_unref(self._ei)
-            self._ei = 0
+        Delegates to ``_teardown_connection`` (issue #16, round 2, M3): the
+        previous hand-rolled cleanup aborted on the first failing step, kept
+        its own per-slot bookkeeping next to the teardown's unique-handle
+        dedup (the two models disagreed on multi-capability handles — the
+        shared handle was stopped and unref'd twice while an aliased touch
+        slot survived stale), and therefore drifted from every hardened
+        path. One shared implementation releases touches, drops the D-Bus
+        cookie, stops each handle once, unrefs once per slot and releases
+        the EI context — every step individually suppressed, so a failing
+        cleanup step can never abort the rest.
+        """
+        self._teardown_connection()
 
 
 class InputBackend:

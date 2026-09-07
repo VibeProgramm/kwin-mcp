@@ -10,8 +10,10 @@ pins select behavior (F8).
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+import dbus
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from test_input_device_lifecycle import (
@@ -30,11 +32,14 @@ import kwin_mcp.input as input_module
 from kwin_mcp.input import (
     _EI_CAP_KEYBOARD,
     _EI_CAP_POINTER_ABSOLUTE,
+    _EI_CAP_TOUCH,
     _EI_EVENT_DEVICE_ADDED,
     _EI_EVENT_DEVICE_REMOVED,
     _EI_EVENT_DEVICE_RESUMED,
     _EI_EVENT_DISCONNECT,
     _EI_EVENT_SEAT_REMOVED,
+    _RECONNECT_ATTEMPTS,
+    EISClient,
 )
 
 MULTI = 0x301  # one handle with several capabilities (several slots)
@@ -75,12 +80,12 @@ def test_drain_events_unref_on_handler_error(monkeypatch: Any) -> None:
     assert len(fake.unrefed_events) == 1
 
 
-def test_remove_multi_cap_device_unref_once(monkeypatch: Any) -> None:
-    """F2: a handle occupying several slots is unref'd exactly once on remove.
+def test_remove_multi_cap_device_releases_each_slot_ref(monkeypatch: Any) -> None:
+    """F2 (round 2, per-slot model): a handle in several slots is unref'd per slot.
 
-    ``_register_device`` places one multi-capability handle into every
-    matching slot; ``_remove_device`` must release the unique handle once,
-    not once per slot.
+    ``_register_device`` takes one ``ei_device_ref`` per occupied slot, so
+    ``_remove_device`` must release one per cleared slot — the matching
+    count, not one per unique handle.
     """
     fake = FakeLibei(
         [(_EI_EVENT_DEVICE_ADDED, MULTI)],
@@ -101,11 +106,11 @@ def test_remove_multi_cap_device_unref_once(monkeypatch: Any) -> None:
 
     assert client._pointer == 0
     assert client._keyboard == 0
-    assert fake.unrefed_devices == [MULTI]
+    assert fake.unrefed_devices == [MULTI, MULTI]
 
 
-def test_seat_removed_unref_multi_cap_device_once(monkeypatch: Any) -> None:
-    """F2: seat removal releases each unique handle once, not once per slot."""
+def test_seat_removed_releases_each_slot_ref(monkeypatch: Any) -> None:
+    """F2 (round 2, per-slot model): seat removal releases each slot's ref."""
     fake = FakeLibei([(_EI_EVENT_SEAT_REMOVED, 0)], {})
     _install(monkeypatch, fake)
     client = _client(fake)
@@ -117,7 +122,9 @@ def test_seat_removed_unref_multi_cap_device_once(monkeypatch: Any) -> None:
 
     assert client._pointer == 0
     assert client._keyboard == 0
-    assert fake.unrefed_devices == [MULTI]
+    # NOTE: the pre-seeded slots hold one ref each (as _register_device took
+    # them), so both are released — see the counting balance tests below.
+    assert fake.unrefed_devices == [MULTI, MULTI]
 
 
 def test_flush_on_released_context_raises_tool_error(monkeypatch: Any) -> None:
@@ -156,10 +163,10 @@ def test_teardown_completes_when_cleanup_step_fails(monkeypatch: Any) -> None:
         attempted_unref.append(device)
         raise RuntimeError("unref boom")
 
-    fake.ei_device_stop_emulating = boom_stop  # type: ignore[method-assign]
-    fake.ei_device_unref = boom_unref  # type: ignore[method-assign]
+    monkeypatch.setattr(fake, "ei_device_stop_emulating", boom_stop)
+    monkeypatch.setattr(fake, "ei_device_unref", boom_unref)
     client = _client(fake)
-    client._eis_iface = FakeIface()
+    monkeypatch.setattr(client, "_eis_iface", FakeIface())
     client._cookie = COOKIE
 
     client._teardown_connection()  # must not raise
@@ -220,9 +227,11 @@ def test_teardown_sends_no_touch_up_on_dead_connection(monkeypatch: Any) -> None
 def test_reconnect_loop_bounded_by_wall_clock(monkeypatch: Any) -> None:
     """F7: a wall-clock deadline bounds one recovery call, not just a count.
 
-    With a fast-forwarded clock the retry loop must stop after the deadline
-    even though the attempt count is not exhausted — and the ToolError names
-    the attempts actually made.
+    With a fast-forwarded clock the retry loop must stop on the deadline
+    even though the attempt count is not exhausted: fewer reconnects than
+    ``_RECONNECT_ATTEMPTS`` are made, and the ToolError names the attempts
+    actually made (consistent with the reconnects performed, not a magic
+    constant).
     """
     fake = FakeLibei([], {})
     _install(monkeypatch, fake)
@@ -231,10 +240,15 @@ def test_reconnect_loop_bounded_by_wall_clock(monkeypatch: Any) -> None:
     client._emulating_devices = set()  # stalled: every attempt fails
     client._setup, setup_calls = _reconnecting_setup(client, emulating=False)
 
-    with pytest.raises(ToolError, match="after 1 reconnect attempt"):
+    with pytest.raises(ToolError) as exc_info:
         client._ensure_devices_ready(timeout_s=0.05)
 
-    assert setup_calls == [1]
+    # The wall-clock budget fired before the attempt-count budget.
+    assert 0 < len(setup_calls) < _RECONNECT_ATTEMPTS
+    # The message reports exactly the attempts actually made.
+    match = re.search(r"after (\d+) reconnect attempts?", str(exc_info.value))
+    assert match is not None
+    assert int(match.group(1)) == len(setup_calls)
 
 
 def test_wait_emulating_sees_queued_events_without_select(monkeypatch: Any) -> None:
@@ -258,3 +272,185 @@ def test_wait_emulating_sees_queued_events_without_select(monkeypatch: Any) -> N
 
     assert client._wait_emulating(0.5) is True
     assert client._emulating_devices == {POINTER, KEYBOARD}
+
+
+# ── Round 2, W1: one ownership model on every path ────────────────────────
+#
+# Ownership is per slot: ``_register_device`` takes one ``ei_device_ref``
+# for every slot a handle occupies, so every release path (remove,
+# seat-removed, teardown, close) must ``ei_device_unref`` once per cleared
+# slot. For each unique handle the taken refs must equal the released
+# unrefs — proved below with a counting fake on the real event paths.
+
+
+class CountingRefLibei(FakeLibei):
+    """FakeLibei additionally counting every ei_device_ref per handle (W1)."""
+
+    def __init__(
+        self,
+        events: list[tuple[int, int]],
+        device_caps: dict[int, set[int]],
+    ) -> None:
+        super().__init__(events, device_caps)
+        self.refed_devices: list[int] = []
+
+    def ei_device_ref(self, device: int) -> int:
+        self.refed_devices.append(device)
+        return device
+
+
+def _registered_multi_cap_client(monkeypatch: Any, fake: CountingRefLibei) -> EISClient:
+    """A client holding MULTI in pointer + keyboard via the real ADDED path."""
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._pointer = 0
+    client._keyboard = 0
+    client._touch_device = 0
+    client._text_device = 0
+    client._emulating_devices = set()
+    client._drain_events()  # DEVICE_ADDED registers MULTI into every matching slot
+    assert client._pointer == MULTI
+    assert client._keyboard == MULTI
+    return client
+
+
+def _assert_refs_balanced(fake: CountingRefLibei, handle: int) -> None:
+    """Every taken ei_device_ref for the handle has a matching unref (W1)."""
+    taken = fake.refed_devices.count(handle)
+    released = fake.unrefed_devices.count(handle)
+    assert taken > 0
+    assert released == taken
+
+
+def test_register_multi_cap_device_refs_once_per_slot(monkeypatch: Any) -> None:
+    """W1 (acquire side): one handle in two slots takes two refs."""
+    fake = CountingRefLibei(
+        [(_EI_EVENT_DEVICE_ADDED, MULTI)],
+        {MULTI: {_EI_CAP_POINTER_ABSOLUTE, _EI_CAP_KEYBOARD}},
+    )
+    _registered_multi_cap_client(monkeypatch, fake)
+
+    assert fake.refed_devices == [MULTI, MULTI]
+
+
+def test_remove_multi_cap_device_balances_refs(monkeypatch: Any) -> None:
+    """W1 (remove path): taken refs equal released unrefs for the handle."""
+    fake = CountingRefLibei(
+        [(_EI_EVENT_DEVICE_ADDED, MULTI)],
+        {MULTI: {_EI_CAP_POINTER_ABSOLUTE, _EI_CAP_KEYBOARD}},
+    )
+    client = _registered_multi_cap_client(monkeypatch, fake)
+
+    fake.queue_events([(_EI_EVENT_DEVICE_REMOVED, MULTI)])
+    client._drain_events()
+
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    _assert_refs_balanced(fake, MULTI)
+
+
+def test_seat_removed_balances_refs(monkeypatch: Any) -> None:
+    """W1 (seat-removed path): taken refs equal released unrefs."""
+    fake = CountingRefLibei(
+        [(_EI_EVENT_DEVICE_ADDED, MULTI)],
+        {MULTI: {_EI_CAP_POINTER_ABSOLUTE, _EI_CAP_KEYBOARD}},
+    )
+    client = _registered_multi_cap_client(monkeypatch, fake)
+    client._emulating_devices = {MULTI}
+
+    fake.queue_events([(_EI_EVENT_SEAT_REMOVED, 0)])
+    client._drain_events()
+
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    _assert_refs_balanced(fake, MULTI)
+
+
+def test_teardown_balances_refs_and_stops_once(monkeypatch: Any) -> None:
+    """W1 (teardown path): refs balanced; emulation stopped once per handle.
+
+    Ownership is per slot (unref per cleared slot) while emulation state is
+    per handle (one stop for the shared handle).
+    """
+    fake = CountingRefLibei(
+        [(_EI_EVENT_DEVICE_ADDED, MULTI)],
+        {MULTI: {_EI_CAP_POINTER_ABSOLUTE, _EI_CAP_KEYBOARD}},
+    )
+    client = _registered_multi_cap_client(monkeypatch, fake)
+    client._emulating_devices = {MULTI}
+
+    client._teardown_connection()
+
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    _assert_refs_balanced(fake, MULTI)
+    assert fake.stopped == [MULTI]
+
+
+def test_close_balances_refs_and_clears_shared_slots(monkeypatch: Any) -> None:
+    """W1 (close path): a 3-slot handle balances; no stale slot survives.
+
+    A handle shared with the touch slot used to leave that slot pointing at
+    the freed handle (and was stopped twice); close must clear every slot.
+    """
+    fake = CountingRefLibei(
+        [(_EI_EVENT_DEVICE_ADDED, MULTI)],
+        {MULTI: {_EI_CAP_POINTER_ABSOLUTE, _EI_CAP_KEYBOARD, _EI_CAP_TOUCH}},
+    )
+    client = _registered_multi_cap_client(monkeypatch, fake)
+    assert client._touch_device == MULTI
+    client._emulating_devices = {MULTI}
+
+    client.close()
+
+    _assert_refs_balanced(fake, MULTI)
+    assert fake.stopped == [MULTI]
+    assert (client._pointer, client._keyboard, client._touch_device, client._text_device) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert client._ei == 0
+
+
+def test_close_completes_when_cleanup_step_fails(monkeypatch: Any) -> None:
+    """M3: one failing close() cleanup step must not abort the rest.
+
+    Mirrors the F4 teardown guarantee: a failing ``stop_emulating``/``unref``
+    or D-Bus ``disconnect`` is tolerated per step, every slot is still
+    cleared and the EI context is still released and reset.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+
+    def boom_stop(device: int) -> None:
+        raise RuntimeError("stop boom")
+
+    attempted_unref: list[int] = []
+
+    def boom_unref(device: int) -> None:
+        attempted_unref.append(device)
+        raise RuntimeError("unref boom")
+
+    def boom_disconnect(cookie: int) -> None:
+        raise dbus.DBusException("bus gone")
+
+    monkeypatch.setattr(fake, "ei_device_stop_emulating", boom_stop)
+    monkeypatch.setattr(fake, "ei_device_unref", boom_unref)
+    client = _client(fake)
+    iface = FakeIface()
+    monkeypatch.setattr(iface, "disconnect", boom_disconnect)
+    monkeypatch.setattr(client, "_eis_iface", iface)
+    client._cookie = COOKIE
+
+    client.close()  # must not raise
+
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    assert client._touch_device == 0
+    assert client._text_device == 0
+    assert sorted(attempted_unref) == sorted([POINTER, KEYBOARD])
+    assert fake.unrefed_ei == [1]
+    assert client._ei == 0
+    assert client._cookie == 0
