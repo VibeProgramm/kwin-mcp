@@ -13,10 +13,11 @@ Parsing specifics covered here (from the 01SW verification round):
   (real dump in /tmp/opencode/verif-kscreen.out) — escapes must be stripped
   before any ``startswith`` check,
 - a disabled output's Geometry line must be skipped (it may be stale); the
-  enabled output's geometry is used; among several enabled outputs,
-  ``priority 1`` wins,
-- xrandr prints ``Screen ... current`` BEFORE the per-monitor lines, so the
-  primary monitor must win over the desktop-wide current size.
+  desktop size is the bounding box (union) of ALL enabled outputs — the
+  logical desktop, not a single monitor; mirrored outputs with identical
+  geometry collapse,
+- xrandr's ``Screen ... current`` line is only a fallback; the desktop size
+  comes from the union of connected monitors' ``WxH+X+Y`` lines.
 """
 
 from __future__ import annotations
@@ -96,7 +97,7 @@ def test_detect_kscreen_doctor_real_ansi_output(monkeypatch) -> None:
 
 
 def test_detect_kscreen_doctor_skips_disabled_output_with_geometry(monkeypatch) -> None:
-    """A disabled output WITH a Geometry line is skipped; the enabled one wins.
+    """A disabled output WITH a Geometry line is skipped; enabled ones count.
 
     Regression for B1: the old parser took the first ``Geometry:`` line in
     the stream without binding it to its Output block, so a disabled output
@@ -121,8 +122,14 @@ def test_detect_kscreen_doctor_skips_disabled_output_with_geometry(monkeypatch) 
     assert _detect_physical_screen_size() == (2560, 1440)
 
 
-def test_detect_kscreen_doctor_priority_one_wins_among_enabled(monkeypatch) -> None:
-    """Two enabled outputs → the priority-1 one is chosen (B1)."""
+def test_detect_kscreen_doctor_bbox_of_enabled_outputs(monkeypatch) -> None:
+    """Two enabled outputs → the bounding box of the logical desktop.
+
+    Contract change (F3): auto-detect returns the union of enabled output
+    geometries, not a single monitor. On DP-1 1920x1080@0,0 + DP-2
+    2560x1440@1920,0 the old priority-1 pick returned 2560x1440 while the
+    logical desktop is 4480x1440.
+    """
     monkeypatch.setattr(
         core_module.shutil,
         "which",
@@ -132,15 +139,87 @@ def test_detect_kscreen_doctor_priority_one_wins_among_enabled(monkeypatch) -> N
         core_module.subprocess,
         "run",
         lambda *a, **k: _run_result(
-            "Output: 1 HDMI-A-1 enabled\n"
-            "priority 2\n"
-            "Geometry: 0,0 1680x1050\n"
-            "Output: 2 eDP-1 enabled\n"
+            "Output: 1 DP-1 enabled\n"
             "priority 1\n"
+            "Geometry: 0,0 1920x1080\n"
+            "Output: 2 DP-2 enabled\n"
+            "priority 2\n"
             "Geometry: 1920,0 2560x1440\n"
         ),
     )
-    assert _detect_physical_screen_size() == (2560, 1440)
+    assert _detect_physical_screen_size() == (4480, 1440)
+
+
+def test_detect_kscreen_doctor_bbox_is_union_not_last_monitor(monkeypatch) -> None:
+    """Bounding box = min(x,y)..max(x+w,y+h) across enabled outputs.
+
+    Guards against a naive "last geometry wins" implementation: the union
+    must grow to the max right/bottom edge, not take the final block alone.
+    """
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1 enabled\n"
+            "Geometry: 0,0 2560x1440\n"
+            "Output: 2 DP-2 enabled\n"
+            "Geometry: 3840,0 1920x1080\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (5760, 1440)
+
+
+def test_detect_kscreen_doctor_mirrored_outputs_collapse(monkeypatch) -> None:
+    """Mirrored outputs with identical geometry collapse into one region.
+
+    Union of coincident rectangles equals a single rectangle, so a mirrored
+    setup (both outputs at 0,0) reports that geometry, not a doubled size.
+    """
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1 enabled\n"
+            "priority 1\n"
+            "Geometry: 0,0 1920x1080\n"
+            "Output: 2 HDMI-A-1 enabled\n"
+            "priority 2\n"
+            "Geometry: 0,0 1920x1080\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (1920, 1080)
+
+
+def test_detect_kscreen_doctor_mixed_enabled_disabled_union(monkeypatch) -> None:
+    """Stale geometry of a disabled output does not inflate the union."""
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1 disabled\n"
+            "Geometry: 0,0 3840x2160\n"
+            "Output: 2 DP-2 enabled\n"
+            "Geometry: 0,0 1920x1080\n"
+            "Output: 3 DP-3 enabled\n"
+            "Geometry: 1920,0 2560x1440\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (4480, 1440)
 
 
 def test_detect_kscreen_doctor_no_enabled_outputs_falls_through(monkeypatch) -> None:
@@ -199,8 +278,12 @@ def test_detect_kscreen_doctor_disabled_token_wins(monkeypatch) -> None:
     assert _detect_physical_screen_size() == (1280, 720)
 
 
-def test_detect_falls_back_to_xrandr_primary(monkeypatch) -> None:
-    """No kscreen-doctor → xrandr primary monitor line is parsed."""
+def test_detect_falls_back_to_xrandr_single_monitor(monkeypatch) -> None:
+    """No kscreen-doctor → a single connected xrandr monitor's geometry.
+
+    One connected monitor (primary or not) yields its own geometry — the
+    union of one rectangle is the rectangle itself.
+    """
     monkeypatch.setattr(
         core_module.shutil, "which", _which(monkeypatch, {"xrandr": "/usr/bin/xrandr"})
     )
@@ -216,12 +299,15 @@ def test_detect_falls_back_to_xrandr_primary(monkeypatch) -> None:
     assert _detect_physical_screen_size() == (1920, 1080)
 
 
-def test_detect_xrandr_primary_beats_earlier_screen_current(monkeypatch) -> None:
-    """xrandr Screen-current printed BEFORE the primary line → primary wins.
+def test_detect_xrandr_union_of_connected_monitors(monkeypatch) -> None:
+    """Connected monitors → the bounding box of the whole framebuffer.
 
-    Regression for B2: xrandr prints ``Screen 0: ... current 4480x1440``
-    (the whole desktop) before per-monitor lines, so the old single-pass
-    parser returned the desktop size instead of the primary monitor's.
+    Contract change (F3): the old parser preferred the primary monitor over
+    the desktop-wide ``Screen current`` line (B2); the new contract is the
+    opposite — the union of connected monitors' ``WxH+X+Y`` IS the logical
+    desktop. On DP-1 1920x1080+0+0 + DP-2 2560x1440+1920+0 the old pick
+    returned 1920x1080 while the logical desktop is 4480x1440. A
+    disconnected monitor contributes nothing.
     """
     monkeypatch.setattr(
         core_module.shutil, "which", _which(monkeypatch, {"xrandr": "/usr/bin/xrandr"})
@@ -233,9 +319,31 @@ def test_detect_xrandr_primary_beats_earlier_screen_current(monkeypatch) -> None
             "Screen 0: minimum 320 x 200, current 4480 x 1440, maximum 32767 x 32767\n"
             "DP-1 connected primary 1920x1080+0+0 (normal left inverted right) 509mm x 286mm\n"
             "DP-2 connected 2560x1440+1920+0 (normal left inverted right) 597mm x 336mm\n"
+            "HDMI-0 disconnected (normal left inverted right)\n"
         ),
     )
-    assert _detect_physical_screen_size() == (1920, 1080)
+    assert _detect_physical_screen_size() == (4480, 1440)
+
+
+def test_detect_xrandr_union_with_negative_offset(monkeypatch) -> None:
+    """A monitor left of the origin (negative +X) widens the bounding box.
+
+    xrandr renders negative offsets as e.g. ``1920x1080+-1920+0``; the union
+    spans from the leftmost edge to the rightmost edge.
+    """
+    monkeypatch.setattr(
+        core_module.shutil, "which", _which(monkeypatch, {"xrandr": "/usr/bin/xrandr"})
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Screen 0: minimum 320 x 200, current 3840 x 1080, maximum 32767 x 32767\n"
+            "DP-1 connected primary 1920x1080+0+0 (normal left inverted right) 509mm x 286mm\n"
+            "DP-2 connected 1920x1080+-1920+0 (normal left inverted right) 509mm x 286mm\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (3840, 1080)
 
 
 def test_detect_falls_back_to_xrandr_current(monkeypatch) -> None:

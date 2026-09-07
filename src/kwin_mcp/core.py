@@ -42,38 +42,31 @@ def _strip_ansi(line: str) -> str:
 
 
 def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
-    """Return the geometry of the best enabled output from ``kscreen-doctor -o``.
+    """Return the bounding box of all enabled outputs from ``kscreen-doctor -o``.
 
     The output is a list of per-output blocks starting with an "Output:" line
     and containing flag lines ("enabled"/"disabled", "priority N") plus a
     "Geometry: x,y WxH" line. Only enabled outputs are considered — a
-    disabled output may still print a (stale) Geometry line. Among several
-    enabled outputs, one with ``priority 1`` wins, otherwise the first
-    enabled one is used (B1). The geometry is the visible desktop size
-    (logical, already scaled by the compositor).
+    disabled output may still print a (stale) Geometry line. The desktop
+    size is the axis-aligned bounding box (union) of every enabled output's
+    geometry: ``min(x,y) .. max(x+w, y+h)`` — the logical desktop, not a
+    single monitor (F3). Mirrored outputs with identical geometry naturally
+    collapse into the same rectangle. Sizes are the visible (logical, already
+    scaled by the compositor) desktop dimensions.
     """
-    best: tuple[int, int] | None = None
-    best_priority = -1
+    boxes: list[tuple[int, int, int, int]] = []  # (x, y, w, h) per enabled output
     enabled = False
-    priority = 0
-    geometry: tuple[int, int] | None = None
+    geometry: tuple[int, int, int, int] | None = None
 
     def finish_block() -> None:
-        nonlocal best, best_priority
-        if not enabled or geometry is None:
-            return
-        # First enabled output wins; a priority-1 output outranks an earlier
-        # enabled output without priority 1.
-        if best is None or (priority == 1 and best_priority != 1):
-            best = geometry
-            best_priority = priority
+        if enabled and geometry is not None:
+            boxes.append(geometry)
 
     for raw_line in output.splitlines():
         line = _strip_ansi(raw_line).strip()
         if line.startswith("Output:"):
             finish_block()
             enabled = False
-            priority = 0
             geometry = None
             # Some kscreen-doctor versions put the flags on the "Output:"
             # line itself ("Output: 1 eDP-1 enabled connected priority 1");
@@ -85,13 +78,15 @@ def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
                 enabled = True
             elif "disabled" in tokens:
                 enabled = False
-            prio_match = re.search(r"priority\s+(\d+)", rest)
-            if prio_match:
-                priority = int(prio_match.group(1))
         elif line.startswith("Geometry:"):
-            match = re.search(r"\b(\d+)x(\d+)\b", line)
+            match = re.search(r"(-?\d+),\s*(-?\d+)\s+(\d+)x(\d+)", line)
             if match:
-                geometry = (int(match.group(1)), int(match.group(2)))
+                geometry = (
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                    int(match.group(4)),
+                )
         else:
             # Generic flag line: may hold a bare flag ("enabled"), a combined
             # set ("enabled connected priority 1"), or just a priority.
@@ -100,52 +95,77 @@ def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
                 enabled = True
             elif "disabled" in tokens:
                 enabled = False
-            prio_match = re.search(r"priority\s+(\d+)", line)
-            if prio_match:
-                try:
-                    priority = int(prio_match.group(1))
-                except ValueError:
-                    priority = 0
     finish_block()
-    return best
+    if not boxes:
+        return None
+    x0 = min(box[0] for box in boxes)
+    y0 = min(box[1] for box in boxes)
+    x1 = max(box[0] + box[2] for box in boxes)
+    y1 = max(box[1] + box[3] for box in boxes)
+    return (x1 - x0, y1 - y0)
+
+
+def _signed_offset(token: str) -> int:
+    """Parse an xrandr offset token like ``+0``, ``-1920`` or ``+-1920``.
+
+    xrandr prints negative offsets with a doubled sign (``1920x1080+-1920+0``
+    for a monitor left of the origin); ``int()`` would raise ValueError on
+    the doubled form.
+    """
+    return int(token[1:]) if token[0] == "+" and token[1:2] == "-" else int(token)
 
 
 def _parse_xrandr(output: str) -> tuple[int, int] | None:
     """Return the desktop size from ``xrandr`` output.
 
-    Two-pass within one scan: the primary monitor line
-    ("DP-1 connected primary 1920x1080+0+0") always wins; the
-    "Screen 0: ... current W x H" line is only a fallback. xrandr prints the
-    Screen line first, so a single-pass scan would return the size of the
-    whole desktop instead of the primary monitor (B2).
+    The desktop size is the axis-aligned bounding box (union) of all
+    connected monitors' geometries (``WxH+X+Y``); disconnected monitors
+    contribute nothing — that union IS the logical desktop (F3). The
+    "Screen 0: ... current W x H" line (the whole framebuffer) is only a
+    fallback for outputs without usable monitor lines.
     """
-    primary: tuple[int, int] | None = None
+    boxes: list[tuple[int, int, int, int]] = []  # (w, h, x, y) per connected monitor
     current: tuple[int, int] | None = None
     for raw_line in output.splitlines():
         line = raw_line.strip()
-        if primary is None and re.search(r"\bconnected\b", line) and "primary" in line:
-            match = re.search(r"\b(\d+)x(\d+)\b", line)
-            if match:
-                primary = (int(match.group(1)), int(match.group(2)))
-        elif current is None and line.startswith("Screen ") and "current " in line:
+        if current is None and line.startswith("Screen ") and "current " in line:
             # xrandr renders the current size with spaces around 'x'.
             match = re.search(r"current\s+(\d+)\s*x\s*(\d+)", line)
             if match:
                 current = (int(match.group(1)), int(match.group(2)))
-    return primary if primary is not None else current
+        if re.search(r"\bconnected\b", line) and not re.search(r"\bdisconnected\b", line):
+            match = re.search(r"\b(\d+)x(\d+)\s*([+-]-?\d+)\s*([+-]-?\d+)\b", line)
+            if match:
+                boxes.append(
+                    (
+                        int(match.group(1)),
+                        int(match.group(2)),
+                        _signed_offset(match.group(3)),
+                        _signed_offset(match.group(4)),
+                    )
+                )
+    if boxes:
+        x0 = min(box[2] for box in boxes)
+        y0 = min(box[3] for box in boxes)
+        x1 = max(box[2] + box[0] for box in boxes)
+        y1 = max(box[3] + box[1] for box in boxes)
+        return (x1 - x0, y1 - y0)
+    return current
 
 
 def _detect_physical_screen_size() -> tuple[int, int]:
     """Detect the visible desktop resolution of the current session.
 
     Uses kscreen-doctor (KDE) first, falling back to xrandr for X11 sessions.
-    Returns the (width, height) of the best active display — the visible
-    (logical) desktop size as the compositor scales it, not the raw panel
-    pixel size — or the default size when detection fails. Called at every
-    session_start so a changed desktop size is picked up by the next virtual
-    session (adopted from 01SW/kwin-mcp).
+    Returns the (width, height) of the bounding box of the logical desktop —
+    the union of enabled outputs' (kscreen-doctor) or connected monitors'
+    (xrandr) geometries, i.e. the visible (logical) desktop size as the
+    compositor scales it, not a single panel's pixel size — or the default
+    size when detection fails. Called at every session_start so a changed
+    desktop size is picked up by the next virtual session (adopted from
+    01SW/kwin-mcp).
     """
-    # kscreen-doctor: Geometry line of an enabled output, e.g. "Geometry: 0,0 1920x1080"
+    # kscreen-doctor: Geometry lines of enabled outputs, e.g. "Geometry: 0,0 1920x1080"
     if shutil.which("kscreen-doctor"):
         try:
             result = subprocess.run(
@@ -157,7 +177,7 @@ def _detect_physical_screen_size() -> tuple[int, int]:
         except (subprocess.SubprocessError, OSError, ValueError):
             pass
 
-    # xrandr: active monitors, e.g. "DP-2 connected primary 1920x1080+0+0"
+    # xrandr: connected monitors, e.g. "DP-2 connected primary 1920x1080+0+0"
     if shutil.which("xrandr"):
         try:
             result = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=5)
