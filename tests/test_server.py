@@ -101,3 +101,25 @@ def test_tool_schemas_valid() -> None:
         assert isinstance(tool.name, str) and tool.name, name
         assert isinstance(tool.description, str) and tool.description, name
         assert isinstance(tool.parameters, dict) and tool.parameters, name
+
+
+def test_server_info_version_is_reported() -> None:
+    """The MCP serverInfo carries the installed package version (A5).
+
+    The SDK defaults version to '', which left clients without version
+    information; the server now resolves it from package metadata with an
+    explicit "unknown" fallback — either way it must be non-empty.
+    """
+    assert server_module.mcp.version
+    assert server_module._server_version() in ("unknown", server_module.mcp.version)
+
+
+def test_server_version_falls_back_when_metadata_missing(monkeypatch) -> None:
+    """PackageNotFoundError → the literal 'unknown', never an empty string."""
+    import importlib.metadata
+
+    def raise_missing(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(server_module.importlib.metadata, "version", raise_missing)
+    assert server_module._server_version() == "unknown"
