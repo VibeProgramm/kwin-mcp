@@ -189,13 +189,16 @@ _STALL_READY_TIMEOUT_S = 0.5
 # additionally stops on the wall-clock budget below (issue #16, F7).
 _RECONNECT_ATTEMPTS = 3
 
-# Overall wall-clock bound for one _ensure_devices_ready call (issue #16,
-# F7), measured from the gate entry alongside the attempt count. Honest
-# worst case per call: the stall wait (0.5s) + this budget (4s) + one
-# in-flight handshake already past the deadline check (<=5s) + its
+# Reconnect-attempt wall budget (issue #16, F7; named issue #18, R2):
+# bounds the retry loop's wall time alongside the attempt count, checked
+# between attempts — NOT a call-wide deadline for one
+# ``_ensure_devices_ready`` call. An in-flight ``_reconnect`` →
+# ``_negotiate_devices(timeout=5.0)`` already past the check runs to its
+# own deadline, so the honest worst case per call stays: the stall wait
+# (0.5s) + this budget (4s) + one overrunning handshake (<=5s) + its
 # re-check (0.5s) ≈ 10s; in the live cycle (fast handshakes) the loop
 # still ends in ~3-4s.
-_RECONNECT_WALL_BUDGET_S = 4.0
+_RECONNECT_RETRY_BUDGET_S = 4.0
 
 # Post-reconnect re-check window for extra required device slots (text/touch)
 # and for the fresh handshake's devices in general (#235 retry loop): a
@@ -567,14 +570,21 @@ class EISClient:
             self._ei = 0
         self._connection_dead = False
 
-    def _invalidate_touches(self) -> None:
+    def _invalidate_touches(self, *, send_up: bool = True) -> None:
         """Finish and release every active touch gesture, reset the IDs.
 
         Shared by every path that drops touch state (F4): the reconnect
         teardown, device PAUSED/REMOVED and seat removal. libei's API
         contract is that pausing or removing a device releases all logically
         down touches, and the reconnect unrefs the whole EI context — in all
-        three cases the stored touch pointers must not survive.
+        these cases the stored touch pointers must not survive.
+
+        ``send_up`` selects finish+release (the device handle is still
+        usable — PAUSED, teardown, seat removal, reconnect) versus
+        release-only (``False`` — DEVICE_REMOVED, issue #18, R3): sending
+        a new ``touch_up`` event into a device the server just dropped is
+        protocol-wrong, while the ``unref`` + drop stays required so no
+        dangling pointer survives.
 
         Per-touch failures are suppressed: a dead connection must not abort
         the cleanup before the touches are unref'd and dropped (leaking them
@@ -586,7 +596,7 @@ class EISClient:
         liveness read mirrors the guards the readiness wait uses
         (``_connection_dead`` / ``_ei == 0``).
         """
-        live = not self._connection_dead and self._ei != 0
+        live = send_up and not self._connection_dead and self._ei != 0
         for touch in self._active_touches.values():
             if live:
                 with contextlib.suppress(Exception):
@@ -931,11 +941,17 @@ class EISClient:
 
         Removing a device releases its logically-down touches (libei resets
         the device state), so dropping the touch device also invalidates the
-        active gestures (F4).
+        active gestures (F4) — release-only, without sending a new
+        ``touch_up`` into the removed device (issue #18, R3): unlike PAUSED
+        (finish + release) the removed handle must receive no new events.
 
         Ownership is per slot (issue #16, round 2): every cleared slot
         releases its own ``ei_device_unref``, matching the per-slot refs
-        ``_register_device`` took for a multi-capability handle.
+        ``_register_device`` took for a multi-capability handle. Each unref
+        is individually suppressed (issue #18, R1): like the sibling paths
+        (``_handle_seat_removed``, ``_teardown_connection``, ``close``) a
+        failing release must still clear every slot and run the touch
+        cleanup instead of aborting at the first failing slot.
         """
         device = _get_libei().ei_event_get_device(event)
         if not device:
@@ -948,9 +964,10 @@ class EISClient:
             if getattr(self, attr) == device:
                 setattr(self, attr, 0)
                 self._emulating_devices.discard(device)
-                _get_libei().ei_device_unref(device)
+                with contextlib.suppress(Exception):
+                    _get_libei().ei_device_unref(device)
         if was_touch_device:
-            self._invalidate_touches()
+            self._invalidate_touches(send_up=False)
 
     def _now_us(self) -> int:
         """Current time in microseconds."""
@@ -990,10 +1007,12 @@ class EISClient:
         therefore retried a bounded number of times (``_RECONNECT_ATTEMPTS``),
         each attempt getting one ``_POST_RECONNECT_READY_TIMEOUT_S`` re-check
         window; exhausting the budget tears the connection down and fails
-        loudly with the attempt count. The loop additionally stops on the
-        ``_RECONNECT_WALL_BUDGET_S`` wall-clock deadline measured from the
-        gate entry (issue #16, F7): the attempt count alone does not bound
-        one call, and the ToolError names the attempts actually made. A
+        loudly with the attempt count. The loop additionally stops starting
+        new attempts on the ``_RECONNECT_RETRY_BUDGET_S`` reconnect-attempt
+        wall budget (issue #16, F7; issue #18, R2 — checked between
+        attempts, not a call-wide deadline: an in-flight handshake may run
+        past it): the attempt count alone does not bound one call, and the
+        ToolError names the attempts actually made. A
         reconnect that raises inside ``_setup`` (D-Bus/libei/handshake
         error) still aborts immediately: the state is already clean (#229)
         and retrying a hard failure only adds latency. The pre-reconnect
@@ -1026,7 +1045,7 @@ class EISClient:
         budget_start = time.monotonic()
         attempts_made = 0
         for attempt in range(1, _RECONNECT_ATTEMPTS + 1):
-            if time.monotonic() - budget_start >= _RECONNECT_WALL_BUDGET_S:
+            if time.monotonic() - budget_start >= _RECONNECT_RETRY_BUDGET_S:
                 break
             _ei_debug(
                 f"devices stalled; reconnecting EIS (attempt {attempt}/{_RECONNECT_ATTEMPTS})"

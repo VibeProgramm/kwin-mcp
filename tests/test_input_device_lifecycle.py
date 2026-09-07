@@ -1280,7 +1280,12 @@ def test_pause_on_pointer_keeps_active_touches(monkeypatch) -> None:
 
 
 def test_removed_touch_device_invalidates_active_touches(monkeypatch) -> None:
-    """REMOVED(touch device) releases its logically-down touches too."""
+    """REMOVED(touch device) releases its logically-down touches, no finish.
+
+    Release-only (issue #18, R3): unlike PAUSED (finish + release) the
+    removed device must receive no new ``touch_up`` — only the release of
+    the stored gesture objects plus the device ``unref``.
+    """
     fake = FakeLibei([(_EI_EVENT_DEVICE_REMOVED, TOUCH)], {})
     _install(monkeypatch, fake)
     client = _client(fake)
@@ -1293,7 +1298,7 @@ def test_removed_touch_device_invalidates_active_touches(monkeypatch) -> None:
 
     assert client._touch_device == 0
     assert TOUCH in fake.unrefed_devices
-    assert fake.touch_ups == [0x888]
+    assert fake.touch_ups == []
     assert fake.unrefed_touches == [0x888]
     assert client._active_touches == {}
     assert client._next_touch_id == 0

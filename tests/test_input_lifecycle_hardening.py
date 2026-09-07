@@ -20,6 +20,7 @@ from test_input_device_lifecycle import (
     COOKIE,
     KEYBOARD,
     POINTER,
+    TOUCH,
     FakeClock,
     FakeIface,
     FakeLibei,
@@ -34,6 +35,7 @@ from kwin_mcp.input import (
     _EI_CAP_POINTER_ABSOLUTE,
     _EI_CAP_TOUCH,
     _EI_EVENT_DEVICE_ADDED,
+    _EI_EVENT_DEVICE_PAUSED,
     _EI_EVENT_DEVICE_REMOVED,
     _EI_EVENT_DEVICE_RESUMED,
     _EI_EVENT_DISCONNECT,
@@ -222,6 +224,158 @@ def test_teardown_sends_no_touch_up_on_dead_connection(monkeypatch: Any) -> None
     assert client._active_touches == {}
     assert client._next_touch_id == 0
     assert client._connection_dead is False
+
+
+class BoomUnrefLibei(FakeLibei):
+    """FakeLibei whose ei_device_unref raises on every call (issue #18, R1)."""
+
+    def ei_device_unref(self, device: int) -> None:
+        raise RuntimeError("unref boom")
+
+
+def test_remove_device_completes_when_unref_fails(monkeypatch: Any) -> None:
+    """R1: a raising unref in ``_remove_device`` must not escape.
+
+    The sibling release paths (``_handle_seat_removed``,
+    ``_teardown_connection``, ``close``) suppress per-slot release failures,
+    so every slot is still cleared and the touch cleanup still runs — the
+    remove path must match that guarantee instead of aborting at the first
+    failing slot.
+    """
+    fake = BoomUnrefLibei(
+        [(_EI_EVENT_DEVICE_REMOVED, POINTER), (_EI_EVENT_DEVICE_REMOVED, KEYBOARD)],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+    client._next_touch_id = 1
+
+    client._drain_events()  # must not raise
+
+    assert client._pointer == 0
+    assert client._keyboard == 0
+    # The pointer slot is cleared even though its unref raised, so the drain
+    # reaches the keyboard event afterwards (previously it never did).
+    assert client._emulating_devices == {TOUCH}
+    # Touch state is untouched: only a touch-slot removal invalidates it.
+    assert client._active_touches == {0: 0x888}
+    assert client._next_touch_id == 1
+
+
+def test_remove_touch_device_with_failing_unref_still_invalidates_touches(
+    monkeypatch: Any,
+) -> None:
+    """R1 (touch half): the touch cleanup runs even when its unref raises.
+
+    A failing ``ei_device_unref`` on the touch slot must not skip
+    ``_invalidate_touches`` — the stored gesture pointers would otherwise
+    dangle into the removed device.
+    """
+    fake = BoomUnrefLibei(
+        [(_EI_EVENT_DEVICE_REMOVED, TOUCH)],
+        {TOUCH: {_EI_CAP_TOUCH}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+    client._next_touch_id = 1
+
+    client._drain_events()  # must not raise
+
+    assert client._touch_device == 0
+    assert TOUCH not in client._emulating_devices
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
+    assert fake.unrefed_touches == [0x888]
+
+
+def test_remove_touch_device_sends_no_touch_up_but_still_unrefs(
+    monkeypatch: Any,
+) -> None:
+    """R3: REMOVED releases gestures without a ``touch_up`` into the remove.
+
+    Unlike PAUSED (finish + release), a removed device only gets a release:
+    ``ei_touch`` is a separate refcounted object, but new events must not be
+    sent into a device the server just dropped. The device ``unref`` itself
+    still happens.
+    """
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_REMOVED, TOUCH)],
+        {TOUCH: {_EI_CAP_TOUCH}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+    client._next_touch_id = 1
+
+    client._drain_events()
+
+    assert fake.touch_ups == []
+    assert fake.unrefed_touches == [0x888]
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
+    assert client._touch_device == 0
+    assert TOUCH in fake.unrefed_devices
+
+
+def test_pause_touch_device_still_sends_touch_up(monkeypatch: Any) -> None:
+    """R3 (PAUSED keeps ``up``): a paused touch device finishes its gestures.
+
+    The device handle stays valid on PAUSED — only its logical state resets
+    to neutral — so a finishing ``touch_up`` is protocol-correct there, and
+    the F6 dead-connection guard still suppresses it when the connection is
+    dead instead.
+    """
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_PAUSED, TOUCH)],
+        {TOUCH: {_EI_CAP_TOUCH}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+
+    client._drain_events()
+
+    assert fake.touch_ups == [0x888]
+    assert fake.unrefed_touches == [0x888]
+
+
+def test_pause_touch_device_sends_no_touch_up_on_dead_connection(
+    monkeypatch: Any,
+) -> None:
+    """F6 covers the teardown path; PAUSED must honour the same liveness rule.
+
+    With ``_connection_dead`` set, pausing the touch device releases the
+    gestures (unref + drop) without sending ``touch_up`` into the dead
+    context.
+    """
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_PAUSED, TOUCH)],
+        {TOUCH: {_EI_CAP_TOUCH}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._connection_dead = True
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+    client._next_touch_id = 1
+
+    client._drain_events()
+
+    assert fake.touch_ups == []
+    assert fake.unrefed_touches == [0x888]
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
 
 
 def test_reconnect_loop_bounded_by_wall_clock(monkeypatch: Any) -> None:
