@@ -31,6 +31,7 @@ import kwin_mcp.input as input_module
 from kwin_mcp.input import (
     _EI_CAP_KEYBOARD,
     _EI_CAP_POINTER_ABSOLUTE,
+    _EI_CAP_TEXT,
     _EI_CAP_TOUCH,
     _EI_EVENT_DEVICE_ADDED,
     _EI_EVENT_DEVICE_PAUSED,
@@ -48,6 +49,9 @@ KEYBOARD = 0x102
 TOUCH = 0x103
 NEW_POINTER = 0x201
 NEW_KEYBOARD = 0x202
+TEXT_DEV = 0x104  # stale-connection text device (paused)
+NEW_TEXT_DEV = 0x204  # fresh-connection text device
+NEW_TOUCH_DEV = 0x205  # fresh-connection touch device
 COOKIE = 7
 
 
@@ -71,6 +75,8 @@ class FakeLibei:
         self.unrefed_touches: list[int] = []
         self.key_calls: list[tuple[int, int]] = []  # (keycode, state)
         self.button_calls: list[tuple[int, int]] = []
+        self.text_keysym_calls: list[tuple[int, int, int]] = []  # (device, keysym, state)
+        self.text_utf8_calls: list[tuple[int, bytes]] = []  # (device, encoded text)
         self.frames: list[int] = []  # device per frame call
         self.setup_fds: list[int] = []  # fds handed to ei_setup_backend_fd
         self.touch_downs: list[tuple[int, float, float]] = []
@@ -128,6 +134,12 @@ class FakeLibei:
 
     def ei_device_button_button(self, device: int, button: int, state: int) -> None:
         self.button_calls.append((button, state))
+
+    def ei_device_text_keysym(self, device: int, keysym: int, state: int) -> None:
+        self.text_keysym_calls.append((device, keysym, state))
+
+    def ei_device_text_utf8(self, device: int, text: bytes) -> None:
+        self.text_utf8_calls.append((device, text))
 
     def ei_device_pointer_motion_absolute(self, device: int, x: float, y: float) -> None:
         return None
@@ -193,6 +205,42 @@ class FakeClock:
     def monotonic(self) -> float:
         self._now += self._step
         return self._now
+
+
+class LateEventFakeLibei(FakeLibei):
+    """FakeLibei appending late events after N drains ended on an empty queue.
+
+    Models a server that advertises/resumes a device only AFTER the pointer +
+    keyboard handshake completes (issue #228): ``_drain_events`` empties the
+    queue in a single pass, so plain event ordering cannot express "later".
+    The trigger fires when ``ei_get_event`` returns empty for the Nth time —
+    the N-1-th empty return ended the handshake's last drain, so the late
+    events land in the queue after it, awaiting the next drain loop.
+    """
+
+    def __init__(
+        self,
+        events: list[tuple[int, int]],
+        device_caps: dict[int, set[int]],
+        late_events: list[tuple[int, int]],
+        late_caps: dict[int, set[int]],
+        late_after_drains: int,
+    ) -> None:
+        super().__init__(events, device_caps)
+        self._late_events = list(late_events)
+        self._late_caps = dict(late_caps)
+        self._late_after_drains = late_after_drains
+        self._empty_returns = 0
+
+    def ei_get_event(self, ei: int) -> int:
+        event = super().ei_get_event(ei)
+        if event == 0 and self._late_events:
+            self._empty_returns += 1
+            if self._empty_returns >= self._late_after_drains:
+                self._events.extend(self._late_events)
+                self.device_caps.update(self._late_caps)
+                self._late_events = []  # fire once
+        return event
 
 
 class FakeIface:
@@ -379,22 +427,28 @@ def test_ensure_devices_ready_reconnects_on_stall(monkeypatch) -> None:
 
 
 def test_ensure_devices_ready_reconnects_after_unresumed_pause(monkeypatch) -> None:
-    """PAUSED drained mid-session without a queued RESUMED → next call rebuilds.
+    """PAUSED queued without a RESUMED → the injection itself rebuilds and lands.
 
     Covers the B6 reconnect path: _pause_device discards the device from the
-    emulating set, so the next injection's readiness wait stalls and takes
-    the reconnect branch.
+    emulating set. Since issue #228 the readiness gate drains the event queue
+    BEFORE probing readiness, so the queued pause is observed before the
+    injection — the same call rebuilds the connection and the injection is
+    delivered to the fresh devices. The old probe-first ordering sent the
+    button into the already-paused device (silent drop; libei discards events
+    from paused devices) and only recovered on the NEXT injection.
     """
     fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
     client = _client(fake)
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
-    client.pointer_button(0x110, _PRESSED)  # injection drains the PAUSED event
-    assert client._emulating_devices == {KEYBOARD}
-
-    client._ensure_devices_ready(timeout_s=0.05)  # next injection recovers
+    client.pointer_button(0x110, _PRESSED)  # gate drains PAUSED, reconnects, delivers
     assert setup_calls == [1]
+    assert client._emulating_devices == {NEW_POINTER, NEW_KEYBOARD}
+    # The injection landed on the fresh pointer, not the paused stale one.
+    assert fake.button_calls == [(0x110, _PRESSED)]
+    assert fake.frames == [NEW_POINTER]
 
 
 def test_ensure_devices_ready_reconnect_runs_real_negotiation(monkeypatch) -> None:
@@ -1137,3 +1191,212 @@ def test_keyboard_hold_uses_single_burst(monkeypatch: Any) -> None:
         (29, _RELEASED),
     ]
     assert fake.frames == [KEYBOARD, KEYBOARD]
+
+
+# ── Issue #228: require_attrs must survive reconnect (text/touch paths) ────
+
+
+def _reconnect_text_path_setup(
+    monkeypatch: Any,
+    fresh: FakeLibei,
+) -> tuple[EISClient, FakeLibei]:
+    """Common plumbing for the issue #228 regression tests.
+
+    Pointer + keyboard work, the stale text device is paused (so the very
+    first text injection stalls and takes the reconnect path), and the real
+    ``_setup``/``_negotiate_devices`` runs against the fresh connection's
+    fake. The clock is fast-forwarded so the 5s stall wait and negotiation
+    deadlines burn no wall time.
+    """
+    stale = FakeLibei(
+        [],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    router = SwitchingLibei([stale, fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+
+    client = _client(stale)
+    client._text_device = TEXT_DEV  # stale text device, currently paused
+    client._bus = FakeBus()
+    return client, stale
+
+
+def _reconnect_touch_path_setup(
+    monkeypatch: Any,
+    fresh: FakeLibei,
+) -> tuple[EISClient, FakeLibei]:
+    """Same as ``_reconnect_text_path_setup`` for the touch path."""
+    stale = FakeLibei(
+        [],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    router = SwitchingLibei([stale, fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+
+    client = _client(stale)
+    client._touch_device = TOUCH  # stale touch device, currently paused
+    client._bus = FakeBus()
+    return client, stale
+
+
+def test_text_utf8_after_reconnect_delivered_when_text_device_resumes_later(
+    monkeypatch: Any,
+) -> None:
+    """Reconnect from the text path waits for the late text device (issue #228).
+
+    The fresh connection resumes pointer + keyboard first; the text device is
+    advertised + resumed only afterwards (late events). The injection must be
+    delivered through the fresh text device — the old code sent it straight
+    into the NULL slot the reconnect left behind.
+    """
+    fresh = LateEventFakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+        late_events=[
+            (_EI_EVENT_DEVICE_ADDED, NEW_TEXT_DEV),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_TEXT_DEV),
+        ],
+        late_caps={NEW_TEXT_DEV: {_EI_CAP_TEXT}},
+        late_after_drains=1,
+    )
+    client, stale = _reconnect_text_path_setup(monkeypatch, fresh)
+
+    client.text_utf8("hi")
+
+    assert client._text_device == NEW_TEXT_DEV
+    assert NEW_TEXT_DEV in client._emulating_devices
+    assert fresh.text_utf8_calls == [(NEW_TEXT_DEV, b"hi")]
+    assert NEW_TEXT_DEV in fresh.frames
+    # The stale connection (including the paused text device) was released.
+    assert stale.unrefed_ei == [1]
+    assert TEXT_DEV in stale.unrefed_devices
+
+
+def test_text_keysym_after_reconnect_delivered_when_text_device_resumes_later(
+    monkeypatch: Any,
+) -> None:
+    """Same guarantee as text_utf8, for the text_keysym path (issue #228)."""
+    fresh = LateEventFakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+        late_events=[
+            (_EI_EVENT_DEVICE_ADDED, NEW_TEXT_DEV),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_TEXT_DEV),
+        ],
+        late_caps={NEW_TEXT_DEV: {_EI_CAP_TEXT}},
+        late_after_drains=1,
+    )
+    client, _ = _reconnect_text_path_setup(monkeypatch, fresh)
+
+    client.text_keysym(0x74, _PRESSED)  # XK_t press
+
+    assert client._text_device == NEW_TEXT_DEV
+    assert fresh.text_keysym_calls == [(NEW_TEXT_DEV, 0x74, _PRESSED)]
+    assert NEW_TEXT_DEV in fresh.frames
+
+
+def test_text_utf8_after_reconnect_delivered_when_text_device_advertised_together(
+    monkeypatch: Any,
+) -> None:
+    """Text device advertised + resumed WITH pointer + keyboard on the fresh
+    connection: the handshake drain registers it in the same pass and the
+    injection is delivered (pins the contract the late-resume tests fix)."""
+    fresh = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_ADDED, NEW_TEXT_DEV),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_TEXT_DEV),
+        ],
+        {
+            NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE},
+            NEW_KEYBOARD: {_EI_CAP_KEYBOARD},
+            NEW_TEXT_DEV: {_EI_CAP_TEXT},
+        },
+    )
+    client, _ = _reconnect_text_path_setup(monkeypatch, fresh)
+
+    client.text_utf8("hi")
+
+    assert client._text_device == NEW_TEXT_DEV
+    assert fresh.text_utf8_calls == [(NEW_TEXT_DEV, b"hi")]
+
+
+def test_text_utf8_after_reconnect_tool_error_when_text_device_not_negotiated(
+    monkeypatch: Any,
+) -> None:
+    """Reconnect that comes back WITHOUT a text device → ToolError (issue #228).
+
+    The stale text device was paused, the injection reconnected, but the fresh
+    connection never advertises a text device. The old code sent the UTF-8
+    text into the NULL device slot (silent drop); the fixed code fails with a
+    clean ToolError instead.
+    """
+    fresh = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    client, _ = _reconnect_text_path_setup(monkeypatch, fresh)
+
+    with pytest.raises(ToolError, match="text device"):
+        client.text_utf8("hi")
+
+    assert fresh.text_utf8_calls == []
+
+
+def test_touch_down_after_reconnect_delivered_when_touch_device_resumes_later(
+    monkeypatch: Any,
+) -> None:
+    """Touch path: reconnect waits for the late touch device (issue #228).
+
+    The pointer fallback (``_touch_device or _pointer``) stays reserved for
+    servers without a touch device — a late-resuming touch device on the
+    fresh connection must be waited for, not bypassed.
+    """
+    fresh = LateEventFakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+        late_events=[
+            (_EI_EVENT_DEVICE_ADDED, NEW_TOUCH_DEV),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_TOUCH_DEV),
+        ],
+        late_caps={NEW_TOUCH_DEV: {_EI_CAP_TOUCH}},
+        late_after_drains=1,
+    )
+    client, _ = _reconnect_touch_path_setup(monkeypatch, fresh)
+
+    touch_id = client.touch_down(5.0, 5.0)
+
+    assert touch_id == 0
+    assert client._touch_device == NEW_TOUCH_DEV
+    assert NEW_TOUCH_DEV in client._emulating_devices
+    assert fresh.touch_downs == [(0x900, 5.0, 5.0)]
+    assert fresh.frames[-1] == NEW_TOUCH_DEV

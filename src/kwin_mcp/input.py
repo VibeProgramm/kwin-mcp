@@ -160,6 +160,12 @@ _EI_EVENT_DEVICE_PAUSED = 9
 # Scroll axis values (in libei, scroll is in pixels)
 _SCROLL_STEP_PIXELS = 15.0
 
+# Post-reconnect re-check window for extra required device slots (text/touch).
+# A fresh handshake only guarantees pointer + keyboard; a required extra slot
+# gets this much time to reach RESUMED before the injection fails loudly
+# instead of being silently dropped into a paused device (wingman #228).
+_POST_RECONNECT_READY_TIMEOUT_S = 2.0
+
 # Slot attributes holding the negotiated EIS device handles. The tuple
 # travels together wherever devices are dropped or released, so it lives in
 # one place instead of being repeated at every teardown site.
@@ -791,6 +797,15 @@ class EISClient:
         ``ei_dispatch`` — the whole connection is rebuilt. A successful
         reconnect guarantees emulating devices, because ``_setup`` runs the
         device negotiation itself and raises on failure.
+
+        After a successful reconnect the requested ``require_attrs`` slots are
+        re-checked against the FRESH connection (bounded re-wait, issue #228):
+        the fresh handshake only guarantees pointer + keyboard, so a text /
+        touch slot may come back paused or unadvertised. If the re-check
+        fails, a clean ToolError stops the injection — a silent drop into a
+        paused or NULL device is exactly what this gate exists to prevent.
+        (A failed reconnect raises inside ``_reconnect`` and never reaches
+        the re-check.)
         """
         if self._wait_emulating(timeout_s, require_attrs):
             return
@@ -799,15 +814,33 @@ class EISClient:
             self._reconnect()
         except (ToolError, RuntimeError) as exc:
             tool_error(f"EIS reconnect failed: {exc}")
+        if not self._wait_emulating(_POST_RECONNECT_READY_TIMEOUT_S, require_attrs):
+            self._teardown_connection()
+            missing = ", ".join(
+                attr.removeprefix("_")
+                for attr in require_attrs
+                if not self._device_emulating(getattr(self, attr))
+            )
+            tool_error(
+                "EIS reconnect did not restore the requested input devices "
+                f"({missing or 'pointer/keyboard'}) within "
+                f"{_POST_RECONNECT_READY_TIMEOUT_S:.0f}s; injection aborted "
+                "instead of being silently dropped into a paused device."
+            )
 
     def _wait_emulating(self, timeout_s: float, require_attrs: tuple[str, ...] = ()) -> bool:
         """Wait until pointer + keyboard (+ extra slots) emulate, draining events.
 
         The queue is drained on every iteration (not only when the fd is
         readable): events queued by a previous dispatch would otherwise sit
-        unprocessed until the deadline expires. A dead connection (DISCONNECT
-        event or failed dispatch) makes the wait fail immediately so the
-        caller takes the reconnect path.
+        unprocessed until the deadline expires. The drain runs BEFORE the
+        readiness probe: a queue left by a prior loop (e.g. the handshake's
+        last pass on a fresh connection) may still hold the DEVICE_ADDED /
+        RESUMED events of a late-resuming extra device (issue #228) —
+        probing first would short-circuit on pointer + keyboard alone and
+        report ready before those events are ever processed. A dead
+        connection (DISCONNECT event or failed dispatch) makes the
+        wait fail immediately so the caller takes the reconnect path.
 
         A NULL (0) EI context fails the wait immediately too (F1): a failed
         reconnect leaves ``_ei == 0``, and probing libei with it
@@ -819,8 +852,6 @@ class EISClient:
         while time.monotonic() < deadline:
             if self._connection_dead or self._ei == 0:
                 return False
-            if self._required_ready(require_attrs):
-                return True
             ei_fd = _get_libei().ei_get_fd(self._ei)
             readable, _, _ = select.select([ei_fd], [], [], 0.05)
             if readable:
@@ -829,6 +860,8 @@ class EISClient:
                     self._connection_dead = True
                     return False
             self._drain_events()
+            if self._required_ready(require_attrs):
+                return True
         return self._required_ready(require_attrs)
 
     def _reconnect(self) -> None:
@@ -937,12 +970,21 @@ class EISClient:
 
         Requires libei >= 1.6 and a KWin EIS server with TEXT support; the
         server resolves the keysym through its own keymap, so the client needs
-        no keymap knowledge.
+        no keymap knowledge. The slot is re-checked after the readiness gate
+        (issue #228): a reconnect inside it may leave the text slot empty on
+        the fresh connection, and the NULL guard must fail the injection with
+        a clean ToolError instead of sending the keysym into device 0.
         """
         if not self._text_device:
             msg = "No EIS text device available (libei >= 1.6 required)"
             raise RuntimeError(msg)
         self._ensure_devices_ready(require_attrs=("_text_device",))
+        if not self._text_device:
+            tool_error(
+                "EIS text device was not re-negotiated after the EIS reconnect "
+                "(the fresh connection did not advertise one); injection aborted "
+                "instead of being sent into a NULL device."
+            )
         _get_libei().ei_device_text_keysym(self._text_device, keysym, state)
         _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
@@ -951,11 +993,21 @@ class EISClient:
         """Send a UTF-8 string through the EIS text device.
 
         The server injects it via its input method (KWin: inputMethod()->sendText).
+        The slot is re-checked after the readiness gate (issue #228), mirroring
+        ``text_keysym``: a reconnect may leave the fresh connection without a
+        text device, and the NULL guard fails cleanly rather than silently
+        dropping the text.
         """
         if not self._text_device:
             msg = "No EIS text device available (libei >= 1.6 required)"
             raise RuntimeError(msg)
         self._ensure_devices_ready(require_attrs=("_text_device",))
+        if not self._text_device:
+            tool_error(
+                "EIS text device was not re-negotiated after the EIS reconnect "
+                "(the fresh connection did not advertise one); injection aborted "
+                "instead of being sent into a NULL device."
+            )
         _get_libei().ei_device_text_utf8(self._text_device, text.encode("utf-8"))
         _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
