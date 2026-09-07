@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,56 @@ from kwin_mcp.screenshot import capture_frame_burst, capture_screenshot_to_file
 from kwin_mcp.session import LiveSession, Session, SessionConfig
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_VIRTUAL_SIZE = (1920, 1080)
+
+
+def _detect_physical_screen_size() -> tuple[int, int]:
+    """Detect the current physical screen resolution.
+
+    Uses kscreen-doctor (KDE) first, falling back to xrandr for X11 sessions.
+    Returns (width, height) of the active display, or the default size when
+    detection fails. Called at every session_start so a changed physical
+    display size is picked up by the next virtual session (adopted from
+    01SW/kwin-mcp).
+    """
+    # kscreen-doctor: Geometry line of an enabled output, e.g. "Geometry: 0,0 1920x1080"
+    if shutil.which("kscreen-doctor"):
+        try:
+            result = subprocess.run(
+                ["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line.startswith("Geometry:"):
+                    continue
+                match = re.search(r"\d+x\d+", line)
+                if match:
+                    w, h = match.group().split("x", 1)
+                    return int(w), int(h)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+    # xrandr: active monitors, e.g. "DP-2 connected primary 1920x1080+0+0"
+    if shutil.which("xrandr"):
+        try:
+            result = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if "connected" in line and "primary" in line:
+                    match = re.search(r"\b(\d+)x(\d+)", line)
+                    if match:
+                        return int(match.group(1)), int(match.group(2))
+                elif line.startswith("Screen ") and "current " in line:
+                    # "Screen 0: minimum 8 x 8, current 2560 x 1440, ..." —
+                    # xrandr renders the current size with spaces around 'x'.
+                    match = re.search(r"current\s+(\d+)\s*x\s*(\d+)", line)
+                    if match:
+                        return int(match.group(1)), int(match.group(2))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+    return _DEFAULT_VIRTUAL_SIZE
+
 
 # Install hints for external binaries
 _INSTALL_HINTS: dict[str, str] = {
@@ -209,8 +260,8 @@ class AutomationEngine:
     def session_start(
         self,
         app_command: str = "",
-        screen_width: int = 1920,
-        screen_height: int = 1080,
+        screen_width: int = 0,
+        screen_height: int = 0,
         enable_clipboard: bool = False,
         keep_screenshots: bool = False,
         isolate_home: bool = False,
@@ -220,6 +271,13 @@ class AutomationEngine:
         """Start an isolated KWin Wayland session, optionally launching an app."""
         if self._session is not None and self._session.is_running:
             tool_error("Session already running. Call session_stop first.")
+
+        # Auto-detect physical screen size when not explicitly requested.
+        # 0 means "match the physical display"; detection runs at every call
+        # so a changed display size is applied to the next virtual session
+        # (adopted from 01SW/kwin-mcp).
+        if screen_width <= 0 or screen_height <= 0:
+            screen_width, screen_height = _detect_physical_screen_size()
 
         self._clipboard_enabled = enable_clipboard
         self._screen_size = (screen_width, screen_height)

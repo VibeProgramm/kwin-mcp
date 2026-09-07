@@ -36,8 +36,20 @@ async def session_start(
             "Leave empty to start session without an app."
         ),
     ] = "",
-    screen_width: Annotated[int, Field(description="Virtual screen width in pixels.")] = 1920,
-    screen_height: Annotated[int, Field(description="Virtual screen height in pixels.")] = 1080,
+    screen_width: Annotated[
+        int,
+        Field(
+            description="Virtual screen width in pixels. 0 or omitted = auto-detect "
+            "physical screen size (measured at session start)."
+        ),
+    ] = 0,
+    screen_height: Annotated[
+        int,
+        Field(
+            description="Virtual screen height in pixels. 0 or omitted = auto-detect "
+            "physical screen size (measured at session start)."
+        ),
+    ] = 0,
     enable_clipboard: Annotated[
         bool,
         Field(
