@@ -294,7 +294,7 @@ class FakeRemoteDesktopIface:
         self.disconnected: list[int] = []
         self._fd = fd
 
-    def connectToEIS(self, caps: int) -> tuple[FakeFd, int]:  # noqa: N802
+    def connectToEIS(self, caps: int, timeout: float = 25.0) -> tuple[FakeFd, int]:  # noqa: N802
         return (FakeFd(self._fd), 42)
 
     def disconnect(self, cookie: int) -> None:
@@ -1046,13 +1046,15 @@ def test_setup_backend_fd_failure_tears_down_cookie_and_context(
     monkeypatch: Any,
 ) -> None:
     """``ei_setup_backend_fd != 0`` → RuntimeError, cookie disconnected,
-    context unref'd exactly once, ``_ei == 0``, fd NOT closed by Python.
+    context unref'd exactly once, ``_ei == 0``, fd CLOSED by the caller.
 
-    Regression for issue #229(b): the inline cleanup unref'd the context but
-    never disconnected the cookie. After ``ei_setup_backend_fd`` libei owns
-    the fd (it closes it on teardown), so the Python side must NOT close it
-    — a double close is worse than leaving it to libei. The pipe descriptor
-    must still be open (fstat succeeds) when the error surfaces.
+    Regression for issue #229(b) + the issue #24 fd-ownership correction:
+    libei takes the fd's ownership ONLY on success (``ei_setup_backend_fd``
+    returns 0 or -errno; on failure the fd is NOT closed by libei), so the
+    fd must be closed by the caller's guard when the setup fails — the old
+    contract ("libei owns it, Python must not touch it") leaked the fd.
+    The pipe descriptor must be gone (fstat → EBADF) when the error
+    surfaces.
     """
     read_fd, write_fd = os.pipe()
     try:
@@ -1069,10 +1071,12 @@ def test_setup_backend_fd_failure_tears_down_cookie_and_context(
         # inline cleanup and the teardown path.
         assert fake.unrefed_ei == [101]
         assert client._ei == 0
-        # libei owns the fd now: the Python side must not have closed it.
-        os.fstat(read_fd)
+        # libei never took ownership (failure) — the caller closed the fd.
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
     finally:
-        os.close(read_fd)  # libei would close it in reality; the fake does not
+        with contextlib.suppress(OSError):
+            os.close(read_fd)  # already closed when the fix works
         os.close(write_fd)
 
 

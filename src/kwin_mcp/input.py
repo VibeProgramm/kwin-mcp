@@ -457,11 +457,12 @@ class EISClient:
         own teardown (B10): the teardown tolerates already-zeroed slots, so
         the double pass releases nothing twice.
 
-        fd ownership (libei.h: ``ei_setup_backend_fd`` "takes ownership of
-        the file descriptor, and will close it when tearing down"): once the
-        fd has been handed to libei, the Python side never closes it — a
-        double close is worse than the rare leak it would prevent. A fd
-        libei never saw (``ei_new_sender`` failed) is closed by the caller.
+        fd ownership (libei 1.6: ``ei_setup_backend_fd`` returns 0 or
+        -errno and takes ownership of the fd ONLY on success — on failure
+        the fd is NOT closed by libei): after a success the Python side
+        never closes it — a double close is worse than the rare leak it
+        would prevent. A fd libei never saw (``ei_new_sender`` failed, or
+        ``ei_setup_backend_fd`` returned non-zero) is closed by the caller.
         """
         # KWin only exposes the EIS interface when it supports remote input;
         # translate the D-Bus failure so callers can treat the input backend as
@@ -480,7 +481,11 @@ class EISClient:
                 | _EI_CAP_BUTTON
                 | _EI_CAP_SCROLL
             )
-            result = self._eis_iface.connectToEIS(dbus.Int32(caps))
+            # Explicit bound (issue #24): KWin answers synchronously; a wedged
+            # compositor must fail the setup promptly so session_start's
+            # degradation to "no input backend" is not delayed by dbus-python's
+            # 25s default. 10s is generous for a synchronous fd handout.
+            result = self._eis_iface.connectToEIS(dbus.Int32(caps), timeout=10.0)
         except dbus.DBusException as exc:
             msg = f"KWin EIS interface unavailable: {exc}"
             raise RuntimeError(msg) from exc
@@ -501,13 +506,16 @@ class EISClient:
             _get_libei().ei_configure_name(self._ei, b"kwin-mcp")
 
             ret = _get_libei().ei_setup_backend_fd(self._ei, fd)
-            # libei accepted the fd (even on a non-zero return it has seen
-            # it) — from here on it owns it and closes it when the context
-            # is torn down; the Python side must not close it again.
-            fd_seen_by_libei = True
             if ret != 0:
+                # libei takes the fd's ownership ONLY on success: on failure
+                # (0 or -errno) it does NOT close the fd, so leave
+                # fd_seen_by_libei False and let the guard below close it
+                # instead of leaking it (issue #24).
                 msg = f"ei_setup_backend_fd failed: {ret}"
                 raise RuntimeError(msg)
+            # Success: libei owns the fd now and closes it when the context
+            # is torn down; the Python side must not close it again.
+            fd_seen_by_libei = True
 
             # Process handshake events to get devices. _negotiate_devices tears
             # the connection down itself on failure (partial handshake = pointer

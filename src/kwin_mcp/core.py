@@ -382,7 +382,17 @@ class AutomationEngine:
         )
 
         lines = [action_result, f"Captured {len(frames)} frames:"]
-        for delay_ms, path in zip(sorted(screenshot_after_ms), frames, strict=True):
+        # Empty (failed) frames are dropped by the capture path on purpose
+        # (screenshot.py: "an empty frame is not an error here"), so pairing
+        # delays with frames must skip them the same way — pairing with
+        # strict zip would raise ValueError on a burst with a failed frame
+        # instead of reporting the frames that did land.
+        landed = [
+            (delay, path)
+            for delay, path in zip(sorted(screenshot_after_ms), frames, strict=False)
+            if path
+        ]
+        for delay_ms, path in landed:
             size_kb = path.stat().st_size / 1024
             lines.append(f"  {delay_ms}ms: {path} ({size_kb:.1f} KB)")
         return "\n".join(lines)
@@ -994,8 +1004,11 @@ class AutomationEngine:
         if info and info.dbus_address:
             try:
                 return kwin_windows.list_windows_by_script(info.dbus_address)
-            except (RuntimeError, dbus.DBusException):
-                pass
+            except (RuntimeError, dbus.DBusException) as exc:
+                # Swallowed on purpose (AT-SPI fallback below), but not
+                # silently: the failure reason is needed to diagnose a
+                # session where every window listing comes from AT-SPI only.
+                logger.debug("KWin scripting window list failed: %s", exc)
         self._get_session()
         resp = self._run_atspi("list_windows")
         return resp["result"]

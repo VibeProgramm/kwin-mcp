@@ -17,12 +17,15 @@ coordinates.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -93,7 +96,13 @@ def get_window_geometries(dbus_address: str = "") -> list[WindowGeometry]:
     if cached is not None and now - cached[0] < GEOMETRY_CACHE_TTL_S:
         return cached[1]
     geometries = fetch_window_geometries(address)
-    _cache[address] = (now, geometries)
+    if geometries:
+        # Only successful fetches are cached (issue #24): a transient failure
+        # (bus hiccup, scripting disabled) would otherwise pin an empty list
+        # for the full TTL and degrade every click in the window to the
+        # (0, 0) no-op offset — compounding inside wait_for_element loops.
+        # An empty result falls through to the next call, which retries.
+        _cache[address] = (now, geometries)
     return geometries
 
 
@@ -160,10 +169,23 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
     DBusGMainLoop(set_as_default=True)
     bus = dbus.bus.BusConnection(dbus_address)
 
-    bus_name = f"org.kwin_mcp.geom.pid{os.getpid()}"
-    object_path = "/org/kwin_mcp/Geom"
+    # Unique names per call (issue #23): a fixed bus name is held by the
+    # first connection, so every later fetch's request_name(DO_NOT_QUEUE)
+    # silently fails and the script's Push lands on the zombie loop — 8s
+    # stall, then [] via the blanket guard. Same pid-monotonic_ns suffix
+    # pattern _run_script_one_shot already uses for activate/list.
+    suffix = f"{os.getpid()}-{time.monotonic_ns() % 1_000_000}"
+    bus_name = f"org.kwin_mcp.geom.{suffix}"
+    object_path = f"/org/kwin_mcp/Geom/{suffix}"
     interface = "org.kwin_mcp.Geom"
-    bus.request_name(bus_name, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+    # Request the primary name; fail fast instead of stalling. DBUS_
+    # REQUEST_REPLY_PRIMARY_OWNER (1) = we own it, ALREADY_OWNER (4) = this
+    # connection holds it already. Any other value (EXISTS/IN_QUEUE) means
+    # another connection owns the name and would swallow the script's Push.
+    owner = bus.request_name(bus_name, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+    if owner not in (1, 4):
+        logger.warning("geometry fetch: bus name %s unavailable (%s)", bus_name, owner)
+        return []
 
     received: dict[str, str] = {}
     loop = GLib.MainLoop()
@@ -178,7 +200,7 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
     worker = threading.Thread(target=loop.run, daemon=True)
     worker.start()
 
-    script_name = f"kwinmcp-geom-pid{os.getpid()}"
+    script_name = f"kwinmcp-geom-{suffix}"
     script_text = (
         _GEOM_SCRIPT_TEMPLATE.replace("@BUS@", bus_name)
         .replace("@PATH@", object_path)
@@ -190,6 +212,9 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
             script_path = os.path.join(tmpdir, "geom.js")
             with open(script_path, "w", encoding="utf-8") as handle:
                 handle.write(script_text)
+            # Explicit bounds (issue #24): dbus-python's 25s default per call
+            # turns one scripting hiccup into ~58s of stuck tool call
+            # (load + run + unload); 10s each is generous for KWin scripting.
             script_id = bus.call_blocking(
                 "org.kde.KWin",
                 "/Scripting",
@@ -197,11 +222,12 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
                 "loadScript",
                 "ss",
                 [script_path, script_name],
+                timeout=10.0,
             )
             if int(script_id) < 0:
                 return []
             bus.get_object("org.kde.KWin", f"/Scripting/Script{int(script_id)}").run(
-                dbus_interface="org.kde.kwin.Script"
+                dbus_interface="org.kde.kwin.Script", timeout=10.0
             )
             deadline = time.monotonic() + FETCH_TIMEOUT_S
             while "payload" not in received and time.monotonic() < deadline:
@@ -216,6 +242,7 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
                     "unloadScript",
                     "s",
                     [script_name],
+                    timeout=10.0,
                 )
         except Exception:
             pass
@@ -369,7 +396,17 @@ def _run_script_one_shot(
     bus_name = f"org.kwin_mcp.script.{script_name}.pid{suffix}"
     object_path = "/org/kwin_mcp/ScriptResult"
     interface = "org.kwin_mcp.ScriptResult"
-    bus.request_name(bus_name, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+    # Fail fast when the (already unique) name is unavailable instead of
+    # stalling for the timeout with the Push going nowhere (issue #24, same
+    # shape as the geometry fetch). Callers translate the RuntimeError into
+    # their AT-SPI fallback, exactly like a scripting failure.
+    owner = bus.request_name(bus_name, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
+    if owner not in (1, 4):
+        msg = (
+            f"could not acquire D-Bus name {bus_name} for the KWin script "
+            f"result (request_name={owner})"
+        )
+        raise RuntimeError(msg)
 
     received: dict[str, str] = {}
     loop = GLib.MainLoop()
