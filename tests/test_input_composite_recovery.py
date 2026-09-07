@@ -63,7 +63,8 @@ class RecoverySwitchingLibei(SwitchingLibei):
     ``triggers`` maps a global 0-based ``ei_dispatch`` count to server events
     queued into the then-current connection, so the drain inside that call's
     post-send ``_flush`` observes a mid-operation DISCONNECT — the window a
-    recovery-injecting fake must hit.
+    recovery-injecting fake must hit. (``ei_dispatch`` is void in libei 1.6;
+    death is only ever a queued DISCONNECT event, issue #22.)
     """
 
     def __init__(
@@ -75,18 +76,52 @@ class RecoverySwitchingLibei(SwitchingLibei):
         self._triggers = dict(triggers)
         self.dispatches = 0
 
-    def ei_dispatch(self, ei: int) -> int:
+    def ei_dispatch(self, ei: int) -> None:
         assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
         pending = self._triggers.pop(self.dispatches, None)
         self.dispatches += 1
         if pending is not None:
             self.current.queue_events(pending)
-        return self.current.dispatch_result
+
+
+class LateDisconnectSwitchingLibei(SwitchingLibei):
+    """SwitchingLibei queueing a DISCONNECT after the Nth drain completes.
+
+    Issue #22 honest-delivery contract: ``ei_dispatch`` is void, death is a
+    queued DISCONNECT event, and a DISCONNECT drained by a post-send flush
+    raises "delivery unconfirmed". A mid-operation recovery is therefore
+    discovered by the PRE-SEND readiness gate of the following injection
+    (the non-raising scope). Queueing at the END of the Nth drain — the
+    empty ``ei_get_event`` terminator — models the asynchronous server push:
+    the event sits in the queue until the next gate's drain observes it.
+    """
+
+    def __init__(
+        self,
+        fakes: list[FakeLibei],
+        late_events: list[tuple[int, int]],
+        late_after_drains: int,
+    ) -> None:
+        super().__init__(fakes)
+        self._late_events = list(late_events)
+        self._late_after_drains = late_after_drains
+        self._empty_returns = 0
+
+    def ei_get_event(self, ei: int) -> int:
+        event = self.current.ei_get_event(ei)
+        if event == 0:
+            self._empty_returns += 1
+            if self._empty_returns >= self._late_after_drains and self._late_events:
+                self.current.queue_events(self._late_events)
+                self._late_events = []  # fire once
+        return event
 
 
 def _composite_setup(
     monkeypatch: Any,
-    triggers: dict[int, list[tuple[int, int]]],
+    triggers: dict[int, list[tuple[int, int]]] | None = None,
+    *,
+    late_disconnect_after_drains: int | None = None,
 ) -> tuple[InputBackend, EISClient, FakeLibei, FakeLibei]:
     """A live backend on the stale connection with a fresh handshake queued.
 
@@ -95,6 +130,10 @@ def _composite_setup(
     production ``_resume_device``/``_replay_held_state`` path. Sleeps are
     no-ops (timing is not under test); ``select`` is patched out like in the
     lifecycle harness.
+
+    ``triggers`` (dispatch-count injection) or
+    ``late_disconnect_after_drains`` (drain-end injection) select the
+    recovery vehicle; see the two fakes above.
     """
     stale = FakeLibei(
         [],
@@ -109,7 +148,14 @@ def _composite_setup(
         ],
         {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
     )
-    router = RecoverySwitchingLibei([stale, fresh], triggers)
+    if late_disconnect_after_drains is not None:
+        router = LateDisconnectSwitchingLibei(
+            [stale, fresh],
+            [(_EI_EVENT_DISCONNECT, 0)],
+            late_disconnect_after_drains,
+        )
+    else:
+        router = RecoverySwitchingLibei([stale, fresh], triggers or {})
     monkeypatch.setattr(input_module, "_get_libei", lambda: router)
     monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
     monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
@@ -125,13 +171,15 @@ def _composite_setup(
 def test_click_with_modifiers_survives_mid_operation_reconnect(monkeypatch: Any) -> None:
     """Ctrl+click with a DISCONNECT between the modifier DOWN and the click.
 
-    Dispatches: move(0), modifier burst(1, injects DISCONNECT), click
-    DOWN(2, reconnects first). The reconnect must replay the transient
-    modifier so the click lands WITH Ctrl: the stale connection saw only
-    the initial press, the fresh handshake replays it before the click
+    Contract correction (issue #22): ``ei_dispatch`` is void and a
+    DISCONNECT drained by a post-send flush raises "delivery unconfirmed",
+    so the recovery is injected at the END of the modifier burst's drain —
+    the click's PRE-SEND readiness gate (non-raising scope) then observes
+    it, reconnects first, and replays the transient modifier so the click
+    lands WITH Ctrl. The fresh handshake replays it before the click
     frames, and the operation-end release clears the set.
     """
-    backend, client, stale, fresh = _composite_setup(monkeypatch, {1: [(_EI_EVENT_DISCONNECT, 0)]})
+    backend, client, stale, fresh = _composite_setup(monkeypatch, late_disconnect_after_drains=4)
 
     backend.mouse_click(10, 20, modifiers=["ctrl"])
 
@@ -147,13 +195,13 @@ def test_click_with_modifiers_survives_mid_operation_reconnect(monkeypatch: Any)
 def test_drag_with_modifier_survives_mid_operation_reconnect(monkeypatch: Any) -> None:
     """Alt+drag with a DISCONNECT between the button DOWN and the motion.
 
-    Dispatches: move(0), modifier burst(1), button DOWN(2, injects
-    DISCONNECT), motions(3+, reconnect first). Both the transient modifier
-    and the drag button must be replayed on the fresh connection: the
-    motion frames run with the button logically down, not as a
-    button-less motion.
+    Contract correction (issue #22): the DISCONNECT is queued at the end of
+    the button-DOWN flush's drain; the next motion's PRE-SEND readiness
+    gate observes it, reconnects first, and replays both the transient
+    modifier and the drag button on the fresh connection: the motion
+    frames run with the button logically down, not as a button-less motion.
     """
-    backend, client, stale, fresh = _composite_setup(monkeypatch, {2: [(_EI_EVENT_DISCONNECT, 0)]})
+    backend, client, stale, fresh = _composite_setup(monkeypatch, late_disconnect_after_drains=6)
 
     backend.mouse_drag(10, 20, 30, 20, modifiers=["alt"])
 
@@ -172,12 +220,13 @@ def test_drag_with_modifier_survives_mid_operation_reconnect(monkeypatch: Any) -
 def test_drag_button_replayed_after_mid_operation_reconnect(monkeypatch: Any) -> None:
     """Modifier-less drag with a DISCONNECT right after the button DOWN.
 
-    Dispatches: move(0), button DOWN(1, injects DISCONNECT), motions(2+,
-    reconnect first). Pins the button leg on its own: the fresh handshake
+    Contract correction (issue #22): the DISCONNECT is queued at the end of
+    the button-DOWN flush's drain; the first motion's pre-send gate
+    reconnects first. Pins the button leg on its own: the fresh handshake
     replays the transient button press, the release ends the gesture, and
     no modifier traffic exists on either connection.
     """
-    backend, client, stale, fresh = _composite_setup(monkeypatch, {1: [(_EI_EVENT_DISCONNECT, 0)]})
+    backend, client, stale, fresh = _composite_setup(monkeypatch, late_disconnect_after_drains=4)
 
     backend.mouse_drag(10, 20, 30, 20)
 
@@ -216,19 +265,16 @@ def test_click_keeps_pre_existing_cross_call_hold(monkeypatch: Any) -> None:
 def test_click_failure_releases_transient_intent(monkeypatch: Any) -> None:
     """A ToolError mid-click releases the transient intent (no phantom hold).
 
-    DISCONNECT injected on the click DOWN's own flush; the click UP then
-    fails its readiness gate (reconnect stub raises). The operation's
-    ``finally`` already dropped the transient Ctrl, so the held set stays
-    empty instead of leaking a phantom hold into the next handshake replay.
+    Contract correction (issue #22): the DISCONNECT is queued at the end of
+    the click DOWN's flush drain, so the DOWN's flush itself raises the
+    "delivery unconfirmed" ToolError (the click UP below never runs). The
+    operation's ``finally`` already dropped the transient Ctrl, so the held
+    set stays empty instead of leaking a phantom hold into the next
+    handshake replay.
     """
     backend, client, _stale, _fresh = _composite_setup(
         monkeypatch, {2: [(_EI_EVENT_DISCONNECT, 0)]}
     )
-
-    def boom_setup() -> None:
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(client, "_setup", boom_setup)
 
     with pytest.raises(ToolError):
         backend.mouse_click(10, 20, modifiers=["ctrl"])

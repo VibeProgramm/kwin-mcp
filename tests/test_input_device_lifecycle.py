@@ -58,7 +58,13 @@ COOKIE = 7
 
 
 class FakeLibei:
-    """Minimal libei stub covering device lifecycle calls and injection."""
+    """Minimal libei stub covering device lifecycle calls and injection.
+
+    ``ei_dispatch`` mirrors the real libei 1.6 API: VOID. Death is modelled
+    by queueing a DISCONNECT event (``queue_events`` /
+    ``DispatchInjectingLibei``), never by a return code — the old
+    ``dispatch_result`` knob modelled an API that does not exist (issue #22).
+    """
 
     def __init__(
         self,
@@ -69,7 +75,6 @@ class FakeLibei:
         self._event_meta: dict[int, tuple[int, int]] = {}
         self._next_id = 0
         self.device_caps = device_caps
-        self.dispatch_result = 0  # ei_dispatch return value (negative = failure)
         self.started: list[tuple[int, int]] = []  # (device, sequence)
         self.stopped: list[int] = []
         self.unrefed_devices: list[int] = []
@@ -99,9 +104,9 @@ class FakeLibei:
         assert ei != 0, "ei_get_fd called with NULL EI context (segfault guard)"
         return 9
 
-    def ei_dispatch(self, ei: int) -> int:
+    def ei_dispatch(self, ei: int) -> None:
+        """Void dispatch — the real libei 1.6 signature (issue #22)."""
         assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
-        return self.dispatch_result
 
     def ei_get_event(self, ei: int) -> int:
         if not self._events:
@@ -348,6 +353,38 @@ def _reconnecting_setup(client: EISClient, emulating: bool) -> tuple[Any, list[i
     return fake_setup, calls
 
 
+class DispatchInjectingLibei(FakeLibei):
+    """FakeLibei queueing server events from inside ``ei_dispatch``.
+
+    Fires once: the first post-send ``_flush`` dispatch of the call under
+    test extends the event queue, so the drain inside that same ``_flush``
+    observes the injected events — the window pre-queued events cannot hit
+    (the pre-send readiness drain, F8, would consume them first).
+
+    This is also the death-injection vehicle since the dispatch-contract
+    correction (issue #22): ``ei_dispatch`` is void in libei 1.6, so a
+    server/socket death is modelled by queueing a DISCONNECT event from
+    inside the dispatch — the flush's own drain then observes it and the
+    honest-delivery raise fires.
+    """
+
+    def __init__(
+        self,
+        events: list[tuple[int, int]],
+        device_caps: dict[int, set[int]],
+        inject: list[tuple[int, int]],
+    ) -> None:
+        super().__init__(events, device_caps)
+        self._inject = list(inject)
+        self._armed = True
+
+    def ei_dispatch(self, ei: int) -> None:
+        assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
+        if self._armed:
+            self._armed = False
+            self._events.extend(self._inject)
+
+
 def test_wait_emulating_true_when_devices_emulating(monkeypatch) -> None:
     """Emulating devices short-circuit the wait without draining anything."""
     fake = FakeLibei([], {})
@@ -591,44 +628,45 @@ def test_disconnect_event_flags_dead_connection_instead_of_raising(monkeypatch) 
     assert fake.key_calls == [(30, _PRESSED), (31, _PRESSED)]
 
 
-def test_dispatch_failure_triggers_reconnect_on_next_injection(monkeypatch) -> None:
-    """ei_dispatch() < 0 (dead socket, no DISCONNECT event) → ToolError, then recovery.
+def test_post_send_disconnect_raises_tool_error_then_next_injection_rebuilds(
+    monkeypatch,
+) -> None:
+    """A DISCONNECT drained by the post-send flush → ToolError, then recovery.
 
-    Regression for B3(a): the negative return used to be ignored, leaving the
-    client "emulating" forever and injecting into a void.
+    Contract correction (issue #22 — NOT a test weakening): ``ei_dispatch``
+    is void in libei 1.6; there is no negative return to branch on. Death is
+    signalled by the DISCONNECT event libei synthesizes, here queued from
+    inside the flush's own dispatch (the same window a real dead socket
+    occupies). The old ``dispatch_result`` knob modelled an API that does
+    not exist.
 
-    Contract change (issue #234 — NOT a test weakening): the first injection
-    used to return success while the event was silently lost (at-most-once +
-    silent loss). Honest delivery semantics raise ToolError from the post-send
-    flush (delivery unconfirmed) and deliver on the NEXT injection, which
-    rebuilds the connection.
+    Honest delivery semantics (#234 on the real API): the first injection
+    raises ToolError from the post-send flush (delivery unconfirmed) and
+    delivers on the NEXT injection, which rebuilds the connection.
     """
-    fake = FakeLibei([], {})
-    fake.dispatch_result = -1
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
     client = _client(fake)
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
     with pytest.raises(ToolError, match="input delivery failed"):
-        client.keyboard_key(30, _PRESSED)  # flush dispatches into a dead socket
+        client.keyboard_key(30, _PRESSED)  # flush drains the death DISCONNECT
     assert client._connection_dead is True
     assert fake.key_calls == [(30, _PRESSED)]  # sent, delivery unconfirmed
 
-    fake.dispatch_result = 0  # a rebuilt connection dispatches fine
     client.keyboard_key(31, _PRESSED)  # next injection rebuilds and delivers
     assert setup_calls == [1]
     assert fake.key_calls == [(30, _PRESSED), (31, _PRESSED)]
 
 
-def test_pointer_button_dispatch_failure_raises_tool_error(monkeypatch) -> None:
-    """pointer_button with a post-send dispatch error raises ToolError (issue #234).
+def test_pointer_button_post_send_disconnect_raises_tool_error(monkeypatch) -> None:
+    """pointer_button whose flush drains a DISCONNECT raises ToolError (#234).
 
     Same honest-delivery contract as keyboard_key: the button event was sent
-    into a dead socket, delivery is unconfirmed — the caller must see the
-    failure instead of a silent success.
+    into a dying connection, delivery is unconfirmed — the caller must see
+    the failure instead of a silent success.
     """
-    fake = FakeLibei([], {})
-    fake.dispatch_result = -1
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
     client = _client(fake)
 
@@ -641,10 +679,11 @@ def test_pointer_button_dispatch_failure_raises_tool_error(monkeypatch) -> None:
 def test_paused_after_send_is_not_tool_error(monkeypatch) -> None:
     """A plain PAUSED is NOT a delivery error — normal event flow (issue #234).
 
-    Issue #234 scopes the ToolError to ``ei_dispatch < 0`` only: KWin pauses
-    its EIS devices around input bursts as normal operation. Here the pause
-    is drained by the readiness gate, the connection is rebuilt, and the
-    injection lands on the fresh devices — no ToolError, delivery succeeded.
+    The delivery ToolError is scoped to a drained DISCONNECT (connection
+    death): KWin pauses its EIS devices around input bursts as normal
+    operation. Here the pause is drained by the readiness gate, the
+    connection is rebuilt, and the injection lands on the fresh devices —
+    no ToolError, delivery succeeded.
     """
     fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
@@ -670,8 +709,7 @@ def test_touch_down_unrefs_touch_on_delivery_failure(monkeypatch) -> None:
     #234): when the flush raises ToolError the orphaned gesture object must
     not leak — it is unref'd and no ID is handed out.
     """
-    fake = FakeLibei([], {})
-    fake.dispatch_result = -1
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
     client = _client(fake)
 
@@ -1742,8 +1780,12 @@ def test_held_key_replayed_on_fresh_connection_after_disconnect(monkeypatch) -> 
     assert client._held_keys == {29}
 
     # The DISCONNECT event is drained by the flush of the next injection.
+    # Contract correction (issue #22): ei_dispatch is void and death is the
+    # drained DISCONNECT, so the flush that discovers it raises
+    # "delivery unconfirmed" instead of silently flagging (honest delivery).
     stale.queue_events([(_EI_EVENT_DISCONNECT, 0)])
-    client._flush()
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client._flush()
     assert client._connection_dead is True
 
     client._ensure_devices_ready(timeout_s=0.05)
@@ -2195,33 +2237,6 @@ def test_success_on_retry_attempt_with_held_state_keeps_it(monkeypatch: Any) -> 
 # readiness drain (F8) and miss the window.
 
 
-class DispatchInjectingLibei(FakeLibei):
-    """FakeLibei queueing server events from inside ``ei_dispatch``.
-
-    Fires once: the first post-send ``_flush`` dispatch of the call under
-    test extends the event queue, so the drain inside that same ``_flush``
-    observes the PAUSED→RESUMED transition — the window the intent race
-    lives in.
-    """
-
-    def __init__(
-        self,
-        events: list[tuple[int, int]],
-        device_caps: dict[int, set[int]],
-        inject: list[tuple[int, int]],
-    ) -> None:
-        super().__init__(events, device_caps)
-        self._inject = list(inject)
-        self._armed = True
-
-    def ei_dispatch(self, ei: int) -> int:
-        assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
-        if self._armed:
-            self._armed = False
-            self._events.extend(self._inject)
-        return self.dispatch_result
-
-
 def test_hold_keys_replays_inside_same_call_post_send_drain(monkeypatch) -> None:
     """Hold + PAUSED→RESUMED inside the same _flush → replay DOWN on the wire.
 
@@ -2301,15 +2316,14 @@ def test_release_button_not_replayed_inside_same_call_post_send_drain(monkeypatc
     assert client._held_buttons == set()
 
 
-def test_hold_keys_rolls_back_on_post_send_dispatch_failure(monkeypatch) -> None:
-    """A _flush dispatch failure (#234) rolls the hold intent back.
+def test_hold_keys_rolls_back_on_post_send_disconnect(monkeypatch) -> None:
+    """A post-send DISCONNECT drained by _flush (#234) rolls the hold back.
 
     The DOWN was queued into libei but delivery is unconfirmed (ToolError);
     the client must not claim the key held.
     """
-    fake = FakeLibei([], {})
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
-    fake.dispatch_result = -1
     client = _client(fake)
 
     with pytest.raises(ToolError, match="input delivery failed"):
@@ -2320,15 +2334,14 @@ def test_hold_keys_rolls_back_on_post_send_dispatch_failure(monkeypatch) -> None
     assert client._connection_dead is True
 
 
-def test_release_keys_restores_on_post_send_dispatch_failure(monkeypatch) -> None:
-    """A _flush dispatch failure (#234) restores the release intent.
+def test_release_keys_restores_on_post_send_disconnect(monkeypatch) -> None:
+    """A post-send DISCONNECT drained by _flush (#234) restores the release.
 
     The UP never confirmedly landed, so the key stays held client-side
     instead of silently flipping to released.
     """
-    fake = FakeLibei([], {})
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
-    fake.dispatch_result = -1
     client = _client(fake)
     client._held_keys = {42}
 
@@ -2340,11 +2353,10 @@ def test_release_keys_restores_on_post_send_dispatch_failure(monkeypatch) -> Non
     assert client._connection_dead is True
 
 
-def test_hold_button_rolls_back_on_post_send_dispatch_failure(monkeypatch) -> None:
-    """Button hold leg of the _flush ToolError rollback."""
-    fake = FakeLibei([], {})
+def test_hold_button_rolls_back_on_post_send_disconnect(monkeypatch) -> None:
+    """Button hold leg of the post-send DISCONNECT ToolError rollback."""
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
-    fake.dispatch_result = -1
     client = _client(fake)
 
     with pytest.raises(ToolError, match="input delivery failed"):
@@ -2362,9 +2374,8 @@ def test_hold_button_failure_keeps_pre_existing_hold(monkeypatch) -> None:
     the send must not silently un-hold it — the server may still hold the
     earlier press.
     """
-    fake = FakeLibei([], {})
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
-    fake.dispatch_result = -1
     client = _client(fake)
     client._held_buttons = {0x110}
 
@@ -2374,11 +2385,10 @@ def test_hold_button_failure_keeps_pre_existing_hold(monkeypatch) -> None:
     assert client._held_buttons == {0x110}
 
 
-def test_release_button_restores_on_post_send_dispatch_failure(monkeypatch) -> None:
-    """Button release leg of the _flush ToolError rollback."""
-    fake = FakeLibei([], {})
+def test_release_button_restores_on_post_send_disconnect(monkeypatch) -> None:
+    """Button release leg of the post-send DISCONNECT ToolError rollback."""
+    fake = DispatchInjectingLibei([], {}, inject=[(_EI_EVENT_DISCONNECT, 0)])
     _install(monkeypatch, fake)
-    fake.dispatch_result = -1
     client = _client(fake)
     client._held_buttons = {0x110}
 

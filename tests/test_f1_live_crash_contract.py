@@ -62,9 +62,9 @@ class ExplodingLibei(FakeLibei):
         assert ei != 0, "ei_get_fd(NULL) — SIGSEGV in real libei"
         return super().ei_get_fd(ei)
 
-    def ei_dispatch(self, ei: int) -> int:
+    def ei_dispatch(self, ei: int) -> None:
         assert ei != 0, "ei_dispatch(NULL) — SIGSEGV in real libei"
-        return super().ei_dispatch(ei)
+        super().ei_dispatch(ei)
 
 
 def test_f1_no_segfault_after_failed_reconnect(monkeypatch) -> None:
