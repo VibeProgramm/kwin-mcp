@@ -2403,6 +2403,72 @@ def test_release_button_restores_on_post_send_disconnect(monkeypatch) -> None:
     assert client._held_buttons == {0x110}
 
 
+class DispatchAtLibei(FakeLibei):
+    """FakeLibei queueing server events on the Nth ``ei_dispatch`` call.
+
+    Unlike ``DispatchInjectingLibei`` (fires on the FIRST dispatch), this
+    targets a specific flush — e.g. the drag's release frame — so the
+    recovery window can be placed mid-operation at a known send.
+    """
+
+    def __init__(
+        self,
+        events: list[tuple[int, int]],
+        device_caps: dict[int, set[int]],
+        inject_at: int,
+        inject: list[tuple[int, int]],
+    ) -> None:
+        super().__init__(events, device_caps)
+        self._inject_at = inject_at
+        self._inject = list(inject)
+        self._dispatches = 0
+
+    def ei_dispatch(self, ei: int) -> None:
+        assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
+        if self._dispatches == self._inject_at:
+            self._events.extend(self._inject)
+        self._dispatches += 1
+
+
+def test_mouse_drag_release_not_replayed_when_recovery_hits_release_flush(
+    monkeypatch,
+) -> None:
+    """Sticky drag button (issue #24): wire ends UP, no DOWN after the last UP.
+
+    ``mouse_drag`` used to drop the transient button hold in its ``finally``
+    — AFTER the release frame was sent — so a PAUSED→RESUMED drained by the
+    release flush's own drain replayed the still-registered button DOWN
+    after the UP: wire [(DOWN, UP, DOWN)], the server stuck with a pressed
+    button while the client considered the operation done. The transient
+    button intent is now dropped BEFORE the release frame (issue #19
+    release ordering, as release_keys/release_button already do), so the
+    replay has nothing to re-press: wire ends (DOWN, UP) with no unpaired
+    DOWN after the last UP.
+    """
+    fake = DispatchAtLibei(
+        [],
+        {},
+        # mouse_drag(10,20 → 30,20) dispatches: move(0), DOWN(1), 10 motions
+        # (2-11), RELEASE(12) — inject into the release flush.
+        inject_at=12,
+        inject=[(EI_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    from kwin_mcp.input import InputBackend
+
+    backend = InputBackend.__new__(InputBackend)
+    backend._client = client
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(input_module.time, "sleep", lambda *_: None)
+        backend.mouse_drag(10, 20, 30, 20)
+
+    # Wire: exactly one DOWN then one UP — no replay press after the UP.
+    assert fake.button_calls == [(0x110, _PRESSED), (0x110, _RELEASED)]
+    assert client._held_buttons == set()
+
+
 def test_hold_keys_rolls_back_on_reconnect_failure(monkeypatch: Any) -> None:
     """A reconnect-path ToolError rolls the hold intent back too.
 

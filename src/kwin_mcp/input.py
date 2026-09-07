@@ -1785,11 +1785,19 @@ class InputBackend:
                     time.sleep(dwell_ms / 1000.0)
 
             time.sleep(0.02)
+            # Drop the transient BUTTON hold BEFORE the release frame (issue
+            # #24 release ordering): a PAUSED→RESUMED drained by the
+            # release's own post-send _flush must find nothing transient to
+            # re-press, or the wire ends DOWN-after-UP (sticky drag button).
+            # Pre-existing cross-call holds survive: drop_transient_hold
+            # removes only what this claim added. The release frame's
+            # delivery failure (ToolError) still ends the operation scope —
+            # the transient intents stay dropped (see drop_transient_hold).
+            self._client.drop_transient_hold([], [btn_code], (frozenset(), pre[1]))
             self._client.pointer_button(btn_code, _RELEASED)
         finally:
-            # Drop BEFORE the modifier release frame (issue #19 release
-            # ordering): a PAUSED→RESUMED drained by the release's own
-            # post-send _flush must find nothing transient to re-press.
+            # Remaining drop: the modifier keys (and the button idempotently,
+            # for failure paths that aborted before the release frame).
             self._client.drop_transient_hold(mod_codes, [btn_code], pre)
 
         # Release modifier keys in reverse order, again as a single frame.
