@@ -21,6 +21,8 @@ real file descriptor.
 
 from __future__ import annotations
 
+import contextlib
+import os
 from typing import Any
 
 import dbus
@@ -79,6 +81,8 @@ class FakeLibei:
         self.text_utf8_calls: list[tuple[int, bytes]] = []  # (device, encoded text)
         self.frames: list[int] = []  # device per frame call
         self.setup_fds: list[int] = []  # fds handed to ei_setup_backend_fd
+        self.setup_backend_fd_result = 0  # ei_setup_backend_fd return value
+        self.new_sender_result = 101  # ei_new_sender return value (0 = failure)
         self.touch_downs: list[tuple[int, float, float]] = []
         self.touch_motions: list[tuple[int, float, float]] = []
         self.touch_ups: list[int] = []
@@ -166,9 +170,12 @@ class FakeLibei:
     def ei_configure_name(self, ei: int, name: bytes) -> None:
         return None
 
+    def ei_new_sender(self, _arg: int) -> int:
+        return self.new_sender_result
+
     def ei_setup_backend_fd(self, ei: int, fd: int) -> int:
         self.setup_fds.append(fd)
-        return 0
+        return self.setup_backend_fd_result
 
 
 class SwitchingLibei:
@@ -256,18 +263,26 @@ class FakeIface:
 class FakeFd:
     """D-Bus unixfd stub for the real-_setup tests."""
 
+    def __init__(self, fd: int = 11) -> None:
+        self._fd = fd
+
     def take(self) -> int:
-        return 11
+        return self._fd
 
 
 class FakeRemoteDesktopIface:
-    """D-Bus EIS interface stub used by real-_setup tests (connectToEIS)."""
+    """D-Bus EIS interface stub used by real-_setup tests (connectToEIS).
 
-    def __init__(self) -> None:
+    The handed-out fd defaults to the sentinel 11; tests that pin fd
+    ownership pass a real (pipe) descriptor instead.
+    """
+
+    def __init__(self, fd: int = 11) -> None:
         self.disconnected: list[int] = []
+        self._fd = fd
 
     def connectToEIS(self, caps: int) -> tuple[FakeFd, int]:  # noqa: N802
-        return (FakeFd(), 42)
+        return (FakeFd(self._fd), 42)
 
     def disconnect(self, cookie: int) -> None:
         self.disconnected.append(int(cookie))
@@ -804,6 +819,145 @@ def test_client_state_fields_exist(monkeypatch) -> None:
     assert client._device_emulating(POINTER) is True
     assert client._device_emulating(0) is False
     assert client._device_emulating(0x999) is False
+
+
+# ── Issue #229: _setup() must be exception-safe on every path after
+#    connectToEIS (cookie disconnect + fd/context cleanup before re-raise) ──
+
+
+def _fresh_setup_client(
+    monkeypatch: Any,
+    fake: FakeLibei,
+    iface: FakeRemoteDesktopIface | None = None,
+) -> EISClient:
+    """A client whose REAL ``_setup`` runs against the given fake libei.
+
+    Mirrors the plumbing of ``test_ensure_devices_ready_reconnect_runs_real_
+    negotiation``: only the D-Bus layer is faked (FakeBus +
+    FakeRemoteDesktopIface via the patched ``dbus.Interface``), while the
+    actual ``_setup`` body (``ei_new_sender`` → ``ei_setup_backend_fd`` →
+    ``_negotiate_devices``) runs for real.
+    """
+    resolved_iface = iface if iface is not None else FakeRemoteDesktopIface()
+    monkeypatch.setattr(input_module, "_get_libei", lambda: fake)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: resolved_iface)
+
+    client = EISClient.__new__(EISClient)
+    client._ei = 0
+    client._cookie = 0
+    client._pointer = 0
+    client._keyboard = 0
+    client._touch_device = 0
+    client._text_device = 0
+    client._next_touch_id = 0
+    client._active_touches = {}
+    client._sequence = 0
+    client._emulating_devices = set()
+    client._connection_dead = False
+    client._eis_iface = None
+    client._bus = FakeBus()
+    return client
+
+
+def test_setup_ei_new_sender_failure_disconnects_cookie_and_closes_fd(
+    monkeypatch: Any,
+) -> None:
+    """``ei_new_sender() == 0`` → RuntimeError, cookie disconnected, fd closed.
+
+    Regression for issue #229(a): the fd from connectToEIS and the cookie
+    were recorded BEFORE the EI context was created. When ``ei_new_sender``
+    returned 0, ``_setup`` raised with the fd still open and the cookie
+    still connected — KWin kept the EIS session alive and, in the
+    ``__init__`` path, nothing ever cleaned them up (permanent leak).
+
+    libei has not seen the fd yet (the failure happened before
+    ``ei_setup_backend_fd``), so the fd is the caller's to close: a real
+    pipe descriptor proves it was actually closed (fstat → EBADF).
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        iface = FakeRemoteDesktopIface(fd=read_fd)
+        fake = FakeLibei([], {})
+        fake.new_sender_result = 0
+        client = _fresh_setup_client(monkeypatch, fake, iface=iface)
+
+        with pytest.raises(RuntimeError, match="Failed to create EI context"):
+            client._setup()
+
+        # The cookie was disconnected (issue #229: this was the missing call).
+        assert iface.disconnected == [42]
+        # No EI context leaked into the client state.
+        assert client._ei == 0
+        # libei never saw the fd (ei_setup_backend_fd was not reached).
+        assert fake.setup_fds == []
+        # libei never saw the fd → the caller closed it (EBADF proves it).
+        with pytest.raises(OSError):
+            os.fstat(read_fd)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(read_fd)  # already closed when the fix works
+        os.close(write_fd)
+
+
+def test_setup_backend_fd_failure_tears_down_cookie_and_context(
+    monkeypatch: Any,
+) -> None:
+    """``ei_setup_backend_fd != 0`` → RuntimeError, cookie disconnected,
+    context unref'd exactly once, ``_ei == 0``, fd NOT closed by Python.
+
+    Regression for issue #229(b): the inline cleanup unref'd the context but
+    never disconnected the cookie. After ``ei_setup_backend_fd`` libei owns
+    the fd (it closes it on teardown), so the Python side must NOT close it
+    — a double close is worse than leaving it to libei. The pipe descriptor
+    must still be open (fstat succeeds) when the error surfaces.
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        iface = FakeRemoteDesktopIface(fd=read_fd)
+        fake = FakeLibei([], {})
+        fake.setup_backend_fd_result = -12  # e.g. -ENOMEM
+        client = _fresh_setup_client(monkeypatch, fake, iface=iface)
+
+        with pytest.raises(RuntimeError, match="ei_setup_backend_fd failed"):
+            client._setup()
+
+        assert iface.disconnected == [42]
+        # Exactly one context unref — no double release between the old
+        # inline cleanup and the teardown path.
+        assert fake.unrefed_ei == [101]
+        assert client._ei == 0
+        # libei owns the fd now: the Python side must not have closed it.
+        os.fstat(read_fd)
+    finally:
+        os.close(read_fd)  # libei would close it in reality; the fake does not
+        os.close(write_fd)
+
+
+def test_setup_negotiation_failure_disconnects_cookie_of_fresh_connection(
+    monkeypatch: Any,
+) -> None:
+    """A handshake that never resumes devices → cookie disconnected too.
+
+    Pins the issue #229 done-condition on the third post-connectToEIS path:
+    ``_negotiate_devices`` tears down on its own (B10), but its teardown
+    must also release the D-Bus cookie of THIS fresh connection — the
+    teardown and the outer guard together must stay idempotent (no double
+    disconnect, no double unref).
+    """
+    fake = FakeLibei([], {})  # no events → handshake times out
+    client = _fresh_setup_client(monkeypatch, fake)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+
+    with pytest.raises(RuntimeError, match="No pointer device available from EIS"):
+        client._setup()
+
+    assert client._eis_iface is not None
+    assert client._eis_iface.disconnected == [42]
+    assert client._ei == 0
+    assert client._cookie == 0
+    # Idempotent double teardown: exactly one unref, no duplicates.
+    assert fake.unrefed_ei == [101]
 
 
 # ── F1: a failed reconnect must leave a NULL EI context unusable ──────────

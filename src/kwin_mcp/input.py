@@ -389,9 +389,21 @@ class EISClient:
     def _setup(self) -> None:
         """Connect to KWin EIS and negotiate devices.
 
-        On any failure after the EI context exists, the half-initialized
-        connection is torn down (devices unref'd, context released,
-        bookkeeping reset) before the error propagates (B10).
+        Exception-safe on every path after ``connectToEIS`` (issue #229):
+        any failure — a NULL context from ``ei_new_sender``, a rejected
+        ``ei_setup_backend_fd``, a failed handshake — fully releases the
+        occupied state (D-Bus cookie disconnected, EI context unref'd when
+        one exists) before the error propagates. In ``__init__`` nobody is
+        left to clean up, and every failed reconnect would otherwise leak
+        one more live cookie. The guard composes with ``_negotiate_devices``'s
+        own teardown (B10): the teardown tolerates already-zeroed slots, so
+        the double pass releases nothing twice.
+
+        fd ownership (libei.h: ``ei_setup_backend_fd`` "takes ownership of
+        the file descriptor, and will close it when tearing down"): once the
+        fd has been handed to libei, the Python side never closes it — a
+        double close is worse than the rare leak it would prevent. A fd
+        libei never saw (``ei_new_sender`` failed) is closed by the caller.
         """
         # KWin only exposes the EIS interface when it supports remote input;
         # translate the D-Bus failure so callers can treat the input backend as
@@ -414,28 +426,44 @@ class EISClient:
         except dbus.DBusException as exc:
             msg = f"KWin EIS interface unavailable: {exc}"
             raise RuntimeError(msg) from exc
+
         fd = result[0].take()
         self._cookie = int(result[1])
 
-        # Create libei sender context
-        self._ei = _get_libei().ei_new_sender(None)
-        if not self._ei:
-            msg = "Failed to create EI context"
-            raise RuntimeError(msg)
+        fd_seen_by_libei = False
+        try:
+            # Create libei sender context
+            self._ei = _get_libei().ei_new_sender(None)
+            if not self._ei:
+                msg = "Failed to create EI context"
+                raise RuntimeError(msg)
 
-        _get_libei().ei_configure_name(self._ei, b"kwin-mcp")
+            _get_libei().ei_configure_name(self._ei, b"kwin-mcp")
 
-        ret = _get_libei().ei_setup_backend_fd(self._ei, fd)
-        if ret != 0:
-            _get_libei().ei_unref(self._ei)
-            self._ei = 0
-            msg = f"ei_setup_backend_fd failed: {ret}"
-            raise RuntimeError(msg)
+            ret = _get_libei().ei_setup_backend_fd(self._ei, fd)
+            # libei accepted the fd (even on a non-zero return it has seen
+            # it) — from here on it owns it and closes it when the context
+            # is torn down; the Python side must not close it again.
+            fd_seen_by_libei = True
+            if ret != 0:
+                msg = f"ei_setup_backend_fd failed: {ret}"
+                raise RuntimeError(msg)
 
-        # Process handshake events to get devices. _negotiate_devices tears
-        # the connection down itself on failure (partial handshake = pointer
-        # emulating but keyboard missing must not leak zombie state, B10).
-        self._negotiate_devices()
+            # Process handshake events to get devices. _negotiate_devices tears
+            # the connection down itself on failure (partial handshake = pointer
+            # emulating but keyboard missing must not leak zombie state, B10);
+            # the guard below makes that double teardown harmless.
+            self._negotiate_devices()
+        except BaseException:
+            if not fd_seen_by_libei:
+                # libei never saw the fd — the caller still owns it, and the
+                # UnixFD object it came from already detached on take().
+                # Suppressed: a failed close (EBADF on an fd already gone)
+                # must not mask the primary error or skip the teardown.
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            self._teardown_connection()
+            raise
 
     def _teardown_connection(self) -> None:
         """Release the whole EIS connection and reset all bookkeeping.
