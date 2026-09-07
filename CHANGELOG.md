@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING**: `session_start` accepts `screen_width=0`/`screen_height=0` (now the default) to match the virtual screen to the visible (logical) desktop, detected at every call via kscreen-doctor (geometry of an enabled output — ANSI-coloured output is stripped, disabled outputs skipped, `priority 1` preferred — with an xrandr fallback: primary monitor first, then the Screen current size) and a 1920x1080 last resort. 0 in either dimension auto-detects both dimensions (no mixed detected/explicit sizes). Clients relying on the old fixed default get an auto-detected size; **pass explicit `screen_width`/`screen_height` to keep the previous behaviour** (adopted from 01SW/kwin-mcp)
+- **BREAKING**: `session_start` accepts `screen_width=0`/`screen_height=0` (now the default) to match the virtual screen to the visible (logical) desktop, detected at every call via kscreen-doctor (bounding box of the logical desktop — the union of enabled outputs' `Geometry: X,Y WxH` rectangles; ANSI-coloured output is stripped, disabled outputs skipped, mirrored outputs collapse) with an xrandr fallback (the union of connected monitors' `WxH+X+Y` rectangles, then the Screen current size) and a 1920x1080 last resort. 0 in either dimension auto-detects both dimensions (no mixed detected/explicit sizes). Clients relying on the old fixed default get an auto-detected size; **pass explicit `screen_width`/`screen_height` to keep the previous behaviour** (adopted from 01SW/kwin-mcp)
 - The MCP `serverInfo` now carries the installed package version (previously an empty string)
 
 ## [0.8.2] - 2026-09-07
