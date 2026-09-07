@@ -87,6 +87,10 @@ class FakeLibei:
         self.touch_motions: list[tuple[int, float, float]] = []
         self.touch_ups: list[int] = []
 
+    def queue_events(self, events: list[tuple[int, int]]) -> None:
+        """Queue server events for the next drain (pause/resume simulations)."""
+        self._events.extend(events)
+
     def ei_get_fd(self, ei: int) -> int:
         # Guard for F1: after a failed reconnect the client must never probe
         # libei with a NULL (0) EI context — the real libei 1.6.0 segfaults
@@ -307,6 +311,8 @@ def _client(fake: FakeLibei) -> EISClient:
     client._emulating_devices = {POINTER, KEYBOARD}
     client._active_touches = {}
     client._next_touch_id = 0
+    client._held_keys = set()
+    client._held_buttons = set()
     client._connection_dead = False
     client._eis_iface = None
     client._cookie = 0
@@ -854,6 +860,8 @@ def _fresh_setup_client(
     client._active_touches = {}
     client._sequence = 0
     client._emulating_devices = set()
+    client._held_keys = set()
+    client._held_buttons = set()
     client._connection_dead = False
     client._eis_iface = None
     client._bus = FakeBus()
@@ -1554,3 +1562,217 @@ def test_touch_down_after_reconnect_delivered_when_touch_device_resumes_later(
     assert NEW_TOUCH_DEV in client._emulating_devices
     assert fresh.touch_downs == [(0x900, 5.0, 5.0)]
     assert fresh.frames[-1] == NEW_TOUCH_DEV
+
+
+# ── Issue #233: held keys/buttons must survive recovery (PAUSED→RESUMED and
+#    reconnect) — one replay re-press frame after start_emulating ────────────
+
+
+def _held_backend(client: EISClient) -> Any:
+    """An InputBackend wrapping the given client (stateful-input tests)."""
+    from kwin_mcp.input import InputBackend
+
+    backend = InputBackend.__new__(InputBackend)
+    backend._client = client
+    return backend
+
+
+def test_held_key_replayed_after_resumed(monkeypatch) -> None:
+    """(a) keyboard_key_down("shift") → PAUSED → RESUMED → one re-press frame.
+
+    The server reset its logical state to neutral on pause ("any keys
+    logically down are released"); after the device resumes, the client must
+    restore its own held state with a single press frame — before the next
+    user injection would observe the missing modifier.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = _held_backend(client)
+
+    backend.keyboard_key_down("shift")
+    assert fake.key_calls == [(42, _PRESSED)]
+    assert client._held_keys == {42}
+    assert fake.frames == [KEYBOARD]
+
+    # Recovery: KWin paused the device (client-side stall model — no explicit
+    # PAUSED events queued) and later resumed it.
+    client._emulating_devices.clear()
+    fake.queue_events([(_EI_EVENT_DEVICE_RESUMED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, POINTER)])
+    fake.key_calls.clear()
+    fake.frames.clear()
+    fake.started.clear()
+
+    client._ensure_devices_ready(timeout_s=0.5)
+
+    # Exactly one re-press frame right after the resume; sequence stays
+    # monotonic across the replay.
+    assert fake.started == [(KEYBOARD, 1), (POINTER, 2)]
+    assert fake.key_calls == [(42, _PRESSED)]
+    assert fake.frames == [KEYBOARD]
+    assert client._held_keys == {42}
+
+    # Until the next user injection nothing further is sent.
+    fake.key_calls.clear()
+    fake.frames.clear()
+    client._drain_events()
+    assert fake.key_calls == []
+    assert fake.frames == []
+
+
+def test_held_key_replayed_on_fresh_connection_after_disconnect(monkeypatch) -> None:
+    """(b) keyboard_key_down("ctrl") → DISCONNECT → reconnect → re-press on
+    the new connection right after the fresh handshake's start_emulating."""
+    stale = FakeLibei([], {})
+    fresh = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_KEYBOARD),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    router = SwitchingLibei([stale, fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+
+    client = _client(stale)
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
+    backend = _held_backend(client)
+
+    backend.keyboard_key_down("ctrl")
+    assert stale.key_calls == [(29, _PRESSED)]
+    assert client._held_keys == {29}
+
+    # The DISCONNECT event is drained by the flush of the next injection.
+    stale.queue_events([(_EI_EVENT_DISCONNECT, 0)])
+    client._flush()
+    assert client._connection_dead is True
+
+    client._ensure_devices_ready(timeout_s=0.05)
+
+    # The replay went to the FRESH connection's keyboard in the same drain
+    # that processed the handshake's RESUMED events (the frame therefore
+    # lands after start_emulating, before any user injection).
+    assert client._keyboard == NEW_KEYBOARD
+    assert fresh.started == [(NEW_POINTER, 1), (NEW_KEYBOARD, 2)]
+    assert fresh.key_calls == [(29, _PRESSED)]
+    assert fresh.frames == [NEW_KEYBOARD]
+    assert client._held_keys == {29}
+
+    # The stale connection saw only the original press.
+    assert stale.frames == [KEYBOARD]
+    assert stale.key_calls == [(29, _PRESSED)]
+
+
+def test_held_button_replayed_after_resumed(monkeypatch) -> None:
+    """(c) mouse_button_down press → PAUSED → RESUMED → one re-press frame."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = _held_backend(client)
+
+    backend.mouse_button_down(10, 20)
+    assert fake.button_calls == [(0x110, _PRESSED)]
+    assert client._held_buttons == {0x110}
+    assert fake.frames == [POINTER, POINTER]  # mouse_move frame + press frame
+
+    client._emulating_devices.clear()
+    fake.queue_events([(_EI_EVENT_DEVICE_RESUMED, POINTER), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)])
+    fake.button_calls.clear()
+    fake.frames.clear()
+    fake.started.clear()
+
+    client._ensure_devices_ready(timeout_s=0.5)
+
+    assert fake.started == [(POINTER, 1), (KEYBOARD, 2)]
+    assert fake.button_calls == [(0x110, _PRESSED)]
+    assert fake.frames == [POINTER]
+    assert client._held_buttons == {0x110}
+
+
+def test_held_state_cleared_by_paired_release_not_replayed(monkeypatch) -> None:
+    """(d) press+release pair → PAUSED → RESUMED → NO re-press (nothing held).
+
+    Ordinary paired operations (combos, click modifiers, legacy typing) must
+    not turn into perpetual held state: only presses without an in-call
+    release populate the held set.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = _held_backend(client)
+
+    backend.keyboard_key_down("shift")
+    backend.keyboard_key_up("shift")
+    assert client._held_keys == set()  # the pair released: nothing to restore
+    fake.key_calls.clear()
+    fake.frames.clear()
+
+    client._emulating_devices.clear()
+    fake.queue_events([(_EI_EVENT_DEVICE_RESUMED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, POINTER)])
+    fake.started.clear()
+
+    client._ensure_devices_ready(timeout_s=0.5)
+
+    # Devices started emulating, but no replay frames were sent.
+    assert fake.started == [(KEYBOARD, 1), (POINTER, 2)]
+    assert fake.key_calls == []
+    assert fake.frames == []
+    assert client._held_keys == set()
+
+
+def test_held_state_replayed_once_per_recovery(monkeypatch) -> None:
+    """(e) RESUMED twice without an intervening PAUSED → the press is sent once.
+
+    Duplicate RESUMED events (KWin re-resumes without an explicit pause) must
+    not re-send the replay frame: the held state is restored once per
+    actual recovery, and the idempotency of ``_resume_device`` covers the
+    replay as well.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = _held_backend(client)
+
+    backend.keyboard_key_down("shift")
+    assert fake.key_calls == [(42, _PRESSED)]
+
+    # Recovery: pause → resume (the press is replayed once).
+    client._emulating_devices.clear()
+    fake.queue_events([(_EI_EVENT_DEVICE_RESUMED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, POINTER)])
+    fake.started.clear()
+    fake.key_calls.clear()
+    fake.frames.clear()
+
+    client._ensure_devices_ready(timeout_s=0.5)
+    assert fake.key_calls == [(42, _PRESSED)]
+    assert fake.frames == [KEYBOARD]
+
+    # A duplicate RESUMED on the still-emulating devices: no second replay.
+    fake.queue_events([(_EI_EVENT_DEVICE_RESUMED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, POINTER)])
+    client._drain_events()
+    assert fake.key_calls == [(42, _PRESSED)]
+    assert fake.frames == [KEYBOARD]
+    assert client._held_keys == {42}
+
+
+def test_held_key_release_after_recovery_does_not_double_release(monkeypatch) -> None:
+    """A key replayed on resume is released normally by keyboard_key_up."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = _held_backend(client)
+
+    backend.keyboard_key_down("shift")
+    client._emulating_devices.clear()
+    fake.queue_events([(_EI_EVENT_DEVICE_RESUMED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, POINTER)])
+
+    client._ensure_devices_ready(timeout_s=0.5)
+    assert fake.key_calls == [(42, _PRESSED), (42, _PRESSED)]  # original + replay
+
+    backend.keyboard_key_up("shift")
+    assert fake.key_calls[-1] == (42, _RELEASED)
+    assert client._held_keys == set()

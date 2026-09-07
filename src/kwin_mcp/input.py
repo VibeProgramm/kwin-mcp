@@ -376,6 +376,13 @@ class EISClient:
         self._eis_iface: dbus.Interface | None = None
         self._next_touch_id: int = 0  # auto-increment touch ID
         self._active_touches: dict[int, int] = {}  # touch_id -> ctypes pointer
+        # API-level held state (issue #233): evdev codes pressed through the
+        # stateful API (keyboard_key_down / mouse_button_down) without the
+        # paired release. PAUSED and reconnects reset the server-side logical
+        # device state; these sets survive that and are re-pressed on
+        # recovery (see _replay_held_state).
+        self._held_keys: set[int] = set()
+        self._held_buttons: set[int] = set()
         # Start-emulating sequence counter, shared across devices. libei.h
         # (ei_device_start_emulating): "The sequence number identifies this
         # transaction between start/stop emulating. It must go up by at least
@@ -641,7 +648,8 @@ class EISClient:
         """Device resumed by the server; request emulation so events flow.
 
         Idempotent: a duplicate RESUMED for an already-emulating device must
-        not restart the emulation sequence (symmetric with ``_pause_device``).
+        not restart the emulation sequence (symmetric with ``_pause_device``)
+        — nor replay the held key/button state twice (issue #233).
         """
         device = _get_libei().ei_event_get_device(event)
         if device in self._emulating_devices:
@@ -650,6 +658,39 @@ class EISClient:
             self._sequence += 1
             _get_libei().ei_device_start_emulating(device, self._sequence)
             self._emulating_devices.add(device)
+            self._replay_held_state(device)
+
+    def _replay_held_state(self, device: int) -> None:
+        """Re-press held keys/buttons on a freshly resumed device (issue #233).
+
+        Per the libei API, PAUSED resets the device's logical state to neutral
+        ("any keys logically down are released"), and a reconnect starts from
+        an equally neutral fresh connection. Without a replay the client's
+        held state — presses sent via ``keyboard_key_down`` /
+        ``mouse_button_down`` without the paired release — silently diverges
+        from the server: held modifiers stop applying and drags lose their
+        button mid-gesture.
+
+        Called from ``_resume_device`` right after ``start_emulating`` (libei
+        rejects events for non-emulating devices), so the replay frame
+        reaches the server before the next user injection. Keys replay on the
+        keyboard device in one frame, buttons on the pointer device in one
+        frame. Touch gestures are NOT replayed: a paused touch is released
+        irreversibly server-side, unlike the discrete key/button state.
+
+        The held sets are created in ``__init__``; objects built without it
+        (bare test doubles) simply have nothing to replay.
+        """
+        held_keys = getattr(self, "_held_keys", None)
+        if device == self._keyboard and held_keys:
+            for keycode in sorted(held_keys):
+                _get_libei().ei_device_keyboard_key(device, keycode, _PRESSED)
+            _get_libei().ei_device_frame(device, self._now_us())
+        held_buttons = getattr(self, "_held_buttons", None)
+        if device == self._pointer and held_buttons:
+            for button in sorted(held_buttons):
+                _get_libei().ei_device_button_button(device, button, _PRESSED)
+            _get_libei().ei_device_frame(device, self._now_us())
 
     def _pause_device(self, event: int) -> None:
         """Device paused by the server; stop sending events to it.
@@ -954,6 +995,23 @@ class EISClient:
         _get_libei().ei_device_frame(self._pointer, self._now_us())
         self._flush()
 
+    def hold_button(self, button: int) -> None:
+        """Press a mouse button and track it as logically down (issue #233).
+
+        The stateful half of ``mouse_button_down``: the press is recorded so a
+        PAUSED/reconnect recovery replays it (``_replay_held_state``);
+        ``release_button`` is the pairing half. Non-stateful presses (clicks,
+        drags) must not go through here — they would turn transient presses
+        into eternal holds.
+        """
+        self.pointer_button(button, _PRESSED)
+        self._held_buttons.add(button)
+
+    def release_button(self, button: int) -> None:
+        """Release a mouse button and drop it from the held set (issue #233)."""
+        self.pointer_button(button, _RELEASED)
+        self._held_buttons.discard(button)
+
     def pointer_scroll(self, dx: float, dy: float) -> None:
         """Scroll by pixel delta."""
         self._ensure_devices_ready()
@@ -994,6 +1052,32 @@ class EISClient:
             _get_libei().ei_device_keyboard_key(self._keyboard, keycode, state)
         _get_libei().ei_device_frame(self._keyboard, self._now_us())
         self._flush()
+
+    def hold_keys(self, keycodes: list[int]) -> None:
+        """Send key presses and track them as logically down (issue #233).
+
+        The stateful half of ``keyboard_key_down``: the pressed codes are
+        recorded so a PAUSED/reconnect recovery replays them
+        (``_replay_held_state``); ``release_keys`` is the pairing half.
+        Ordinary press+release bursts (key combos, click modifiers) must not
+        go through here — they would turn transient presses into eternal
+        holds.
+        """
+        if not keycodes:
+            return
+        self.keyboard_burst([(code, _PRESSED) for code in keycodes])
+        self._held_keys.update(keycodes)
+
+    def release_keys(self, keycodes: list[int]) -> None:
+        """Send key releases and drop them from the held set (issue #233).
+
+        Releases in list order (``keyboard_key_up`` passes the main key
+        first, then the reversed modifiers).
+        """
+        if not keycodes:
+            return
+        self.keyboard_burst([(code, _RELEASED) for code in keycodes])
+        self._held_keys.difference_update(keycodes)
 
     def text_keysym(self, keysym: int, state: int) -> None:
         """Press/release a key by XKB keysym via the EIS text device.
@@ -1320,6 +1404,10 @@ class InputBackend:
     def mouse_button_down(self, x: int, y: int, button: MouseButton = MouseButton.LEFT) -> None:
         """Move to coordinates and press a mouse button without releasing.
 
+        The press is tracked client-side and replayed automatically after an
+        EIS recovery (PAUSED/reconnect), so a drag held across several MCP
+        calls keeps its button down (issue #233).
+
         Args:
             x, y: Coordinates.
             button: Mouse button to press.
@@ -1327,10 +1415,13 @@ class InputBackend:
         btn_code = _BTN_CODES[button]
         self.mouse_move(x, y)
         time.sleep(0.02)
-        self._client.pointer_button(btn_code, _PRESSED)
+        self._client.hold_button(btn_code)
 
     def mouse_button_up(self, x: int, y: int, button: MouseButton = MouseButton.LEFT) -> None:
         """Move to coordinates and release a mouse button.
+
+        Drops the button from the held set, so a subsequent recovery does not
+        replay the release.
 
         Args:
             x, y: Coordinates.
@@ -1339,7 +1430,7 @@ class InputBackend:
         btn_code = _BTN_CODES[button]
         self.mouse_move(x, y)
         time.sleep(0.02)
-        self._client.pointer_button(btn_code, _RELEASED)
+        self._client.release_button(btn_code)
 
     def keyboard_type(self, text: str) -> None:
         """Type a string of text character by character.
@@ -1438,7 +1529,10 @@ class InputBackend:
     def keyboard_key_down(self, key: str) -> None:
         """Press (and hold) a key combination without releasing.
 
-        Useful for holding modifier keys across multiple actions.
+        Useful for holding modifier keys across multiple actions. The pressed
+        codes are tracked client-side and replayed automatically after an EIS
+        recovery (PAUSED/reconnect), so the modifier stays held across MCP
+        calls even when KWin resets the device state in between (issue #233).
 
         Args:
             key: Key to press (e.g., "ctrl", "shift+a", "alt").
@@ -1446,28 +1540,26 @@ class InputBackend:
         modifiers, keycode = _parse_key_combo(key)
 
         # Single frame like _press_key_combo: KWin may pause mid-press.
-        pairs = [(mod, _PRESSED) for mod in modifiers]
-        if keycode is not None:
-            pairs.append((keycode, _PRESSED))
-        if pairs:
-            self._client.keyboard_burst(pairs)
+        codes = [*modifiers, keycode] if keycode is not None else list(modifiers)
+        if codes:
+            self._client.hold_keys(codes)
 
     def keyboard_key_up(self, key: str) -> None:
         """Release a previously pressed key combination.
 
-        Releases in reverse order (main key first, then modifiers).
+        Releases in reverse order (main key first, then modifiers) and drops
+        the codes from the held set, so a subsequent recovery does not replay
+        the released keys.
 
         Args:
             key: Key to release (e.g., "ctrl", "shift+a", "alt").
         """
         modifiers, keycode = _parse_key_combo(key)
 
-        pairs: list[tuple[int, int]] = []
-        if keycode is not None:
-            pairs.append((keycode, _RELEASED))
-        pairs.extend((mod, _RELEASED) for mod in reversed(modifiers))
-        if pairs:
-            self._client.keyboard_burst(pairs)
+        release_codes = [keycode] if keycode is not None else []
+        release_codes.extend(reversed(modifiers))
+        if release_codes:
+            self._client.release_keys(release_codes)
 
     def touch_tap(self, x: int, y: int, hold_ms: int = 0) -> None:
         """Tap at the given coordinates.
