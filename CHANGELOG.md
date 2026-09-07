@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- KWin pauses (and sometimes removes/re-adds) its EIS input devices around input bursts — observed right after session start and after modifier presses — so injections landed on paused devices and were silently dropped, and a stalled connection never recovered. Device lifecycle events (ADDED/REMOVED/RESUMED/PAUSED) are now handled by a central dispatcher shared by the handshake, the post-send flush and the per-injection readiness wait; every injection method first waits until pointer + keyboard are emulating, and if the connection stalls the whole EIS session is rebuilt (fresh connectToEIS, old cookie disconnected, stale device/context references unref'd) instead of losing input forever (adopted from 01SW/kwin-mcp)
+- Modifier combos (e.g. alt+F4, ctrl+shift+t) were spread across several EIS frames with per-key delays, which let KWin pause the devices mid-combo and drop the remaining strokes. Combo key presses are now batched into a single EIS frame (keyboard_burst) with a 20ms gap before the batched release frame; the ctrl+q dual-binding alias still sends its two combos as separate sequential burst pairs, never merged into one frame (adopted from 01SW/kwin-mcp)
+
+### Added
+
+- `session_start` accepts `screen_width=0`/`screen_height=0` (now the default) to match the virtual screen to the physical display, detected at every call via kscreen-doctor (Geometry of an enabled output) with an xrandr fallback (primary monitor, then the Screen current size) and a 1920x1080 last resort; explicitly given sizes keep priority, so existing automation calls are unaffected (adopted from 01SW/kwin-mcp)
+
 ## [0.8.2] - 2026-09-07
 
 ### Fixed
