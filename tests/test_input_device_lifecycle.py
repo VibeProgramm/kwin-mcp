@@ -2180,3 +2180,258 @@ def test_success_on_retry_attempt_with_held_state_keeps_it(monkeypatch: Any) -> 
     assert fresh[2].key_calls == [(42, _PRESSED), (30, _PRESSED)]
     # The exhausted-connection teardown did not happen (still alive).
     assert fresh[2].unrefed_ei == []
+
+
+# ── Issue #19: held-state intent race (set mutation after _flush) ──────────
+#
+# hold_keys/hold_button recorded the held intent only AFTER the post-send
+# _flush returned, so a PAUSED→RESUMED drained inside the same call replayed
+# the stale set: a hold missed its replay (client held, server neutral —
+# silent divergence) while a release re-pressed the just-released key (wire
+# UP then DOWN — sticky). The four methods now record/drop the intent BEFORE
+# sending and roll it back when the send fails with a ToolError. The probes
+# below inject the server events from inside ei_dispatch (a real KWin pushes
+# them mid-flush); pre-queued events would be consumed by the pre-send
+# readiness drain (F8) and miss the window.
+
+
+class DispatchInjectingLibei(FakeLibei):
+    """FakeLibei queueing server events from inside ``ei_dispatch``.
+
+    Fires once: the first post-send ``_flush`` dispatch of the call under
+    test extends the event queue, so the drain inside that same ``_flush``
+    observes the PAUSED→RESUMED transition — the window the intent race
+    lives in.
+    """
+
+    def __init__(
+        self,
+        events: list[tuple[int, int]],
+        device_caps: dict[int, set[int]],
+        inject: list[tuple[int, int]],
+    ) -> None:
+        super().__init__(events, device_caps)
+        self._inject = list(inject)
+        self._armed = True
+
+    def ei_dispatch(self, ei: int) -> int:
+        assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
+        if self._armed:
+            self._armed = False
+            self._events.extend(self._inject)
+        return self.dispatch_result
+
+
+def test_hold_keys_replays_inside_same_call_post_send_drain(monkeypatch) -> None:
+    """Hold + PAUSED→RESUMED inside the same _flush → replay DOWN on the wire.
+
+    Regression probe for issue #19 (hold leg): with the intent recorded
+    before the send, the resume replayed inside the call's own post-send
+    drain re-presses the just-sent key — wire holds DOWN + replay DOWN and
+    the client set agrees with the server instead of diverging from it.
+    """
+    fake = DispatchInjectingLibei(
+        [],
+        {},
+        inject=[(_EI_EVENT_DEVICE_PAUSED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    client.hold_keys([42])
+
+    assert fake.key_calls == [(42, _PRESSED), (42, _PRESSED)]
+    assert fake.frames == [KEYBOARD, KEYBOARD]
+    assert client._held_keys == {42}
+
+
+def test_release_keys_not_replayed_inside_same_call_post_send_drain(monkeypatch) -> None:
+    """Release + PAUSED→RESUMED inside the same _flush → wire ends with UP.
+
+    Regression probe for issue #19 (release leg): with the intent dropped
+    before the send, the resume replayed inside the call's own post-send
+    drain finds nothing to re-press — no trailing DOWN after the UP (sticky
+    modifier) and the client set is empty.
+    """
+    fake = DispatchInjectingLibei(
+        [],
+        {},
+        inject=[(_EI_EVENT_DEVICE_PAUSED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._held_keys = {42}
+
+    client.release_keys([42])
+
+    assert fake.key_calls == [(42, _RELEASED)]
+    assert client._held_keys == set()
+
+
+def test_hold_button_replays_inside_same_call_post_send_drain(monkeypatch) -> None:
+    """Button hold leg of issue #19: same-call replay re-presses the button."""
+    fake = DispatchInjectingLibei(
+        [],
+        {},
+        inject=[(_EI_EVENT_DEVICE_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    client.hold_button(0x110)
+
+    assert fake.button_calls == [(0x110, _PRESSED), (0x110, _PRESSED)]
+    assert client._held_buttons == {0x110}
+
+
+def test_release_button_not_replayed_inside_same_call_post_send_drain(monkeypatch) -> None:
+    """Button release leg of issue #19: wire ends with UP, no trailing DOWN."""
+    fake = DispatchInjectingLibei(
+        [],
+        {},
+        inject=[(_EI_EVENT_DEVICE_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._held_buttons = {0x110}
+
+    client.release_button(0x110)
+
+    assert fake.button_calls == [(0x110, _RELEASED)]
+    assert client._held_buttons == set()
+
+
+def test_hold_keys_rolls_back_on_post_send_dispatch_failure(monkeypatch) -> None:
+    """A _flush dispatch failure (#234) rolls the hold intent back.
+
+    The DOWN was queued into libei but delivery is unconfirmed (ToolError);
+    the client must not claim the key held.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    fake.dispatch_result = -1
+    client = _client(fake)
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.hold_keys([42])
+
+    assert fake.key_calls == [(42, _PRESSED)]
+    assert client._held_keys == set()
+    assert client._connection_dead is True
+
+
+def test_release_keys_restores_on_post_send_dispatch_failure(monkeypatch) -> None:
+    """A _flush dispatch failure (#234) restores the release intent.
+
+    The UP never confirmedly landed, so the key stays held client-side
+    instead of silently flipping to released.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    fake.dispatch_result = -1
+    client = _client(fake)
+    client._held_keys = {42}
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.release_keys([42])
+
+    assert fake.key_calls == [(42, _RELEASED)]
+    assert client._held_keys == {42}
+    assert client._connection_dead is True
+
+
+def test_hold_button_rolls_back_on_post_send_dispatch_failure(monkeypatch) -> None:
+    """Button hold leg of the _flush ToolError rollback."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    fake.dispatch_result = -1
+    client = _client(fake)
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.hold_button(0x110)
+
+    assert fake.button_calls == [(0x110, _PRESSED)]
+    assert client._held_buttons == set()
+
+
+def test_hold_button_failure_keeps_pre_existing_hold(monkeypatch) -> None:
+    """A failed re-hold of an already-held button keeps the original intent.
+
+    The rollback discards only what the call added: re-pressing a button
+    that was already held (e.g. duplicate ``mouse_button_down``) and failing
+    the send must not silently un-hold it — the server may still hold the
+    earlier press.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    fake.dispatch_result = -1
+    client = _client(fake)
+    client._held_buttons = {0x110}
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.hold_button(0x110)
+
+    assert client._held_buttons == {0x110}
+
+
+def test_release_button_restores_on_post_send_dispatch_failure(monkeypatch) -> None:
+    """Button release leg of the _flush ToolError rollback."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    fake.dispatch_result = -1
+    client = _client(fake)
+    client._held_buttons = {0x110}
+
+    with pytest.raises(ToolError, match="input delivery failed"):
+        client.release_button(0x110)
+
+    assert fake.button_calls == [(0x110, _RELEASED)]
+    assert client._held_buttons == {0x110}
+
+
+def test_hold_keys_rolls_back_on_reconnect_failure(monkeypatch: Any) -> None:
+    """A reconnect-path ToolError rolls the hold intent back too.
+
+    Stalled devices + a hard-failing rebuild: the DOWN was never queued, so
+    the pre-send intent must vanish instead of lingering as phantom held
+    state for the next handshake's replay.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    client = _client(fake)
+    client._emulating_devices = set()
+
+    def boom_setup() -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(client, "_setup", boom_setup)
+
+    with pytest.raises(ToolError, match="EIS reconnect failed"):
+        client.hold_keys([42])
+
+    assert client._held_keys == set()
+
+
+def test_release_keys_restores_on_reconnect_failure(monkeypatch: Any) -> None:
+    """A reconnect-path ToolError restores the release intent too.
+
+    The UP was never queued (the gate failed before any send), so the key
+    stays held client-side and the pairing release can be retried.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+    client = _client(fake)
+    client._emulating_devices = set()
+    client._held_keys = {42}
+
+    def boom_setup() -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(client, "_setup", boom_setup)
+
+    with pytest.raises(ToolError, match="EIS reconnect failed"):
+        client.release_keys([42])
+
+    assert client._held_keys == {42}

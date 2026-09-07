@@ -1234,14 +1234,43 @@ class EISClient:
         ``release_button`` is the pairing half. Non-stateful presses (clicks,
         drags) must not go through here — they would turn transient presses
         into eternal holds.
+
+        The intent is recorded BEFORE the send (issue #19): the post-send
+        ``_flush`` drains a PAUSED→RESUMED arriving in the same call, and the
+        replay must already see the new button — recording after the flush
+        misses that same-call recovery and diverges from the server. On a
+        send failure (``ToolError`` from the readiness gate or the flush)
+        the intent rolls back, so the client never claims a button the
+        server did not confirm held.
         """
-        self.pointer_button(button, _PRESSED)
+        was_held = button in self._held_buttons
         self._held_buttons.add(button)
+        try:
+            self.pointer_button(button, _PRESSED)
+        except ToolError:
+            if not was_held:
+                self._held_buttons.discard(button)
+            raise
 
     def release_button(self, button: int) -> None:
-        """Release a mouse button and drop it from the held set (issue #233)."""
-        self.pointer_button(button, _RELEASED)
+        """Release a mouse button and drop it from the held set (issue #233).
+
+        The intent is dropped BEFORE the send (issue #19): the post-send
+        ``_flush`` drains a PAUSED→RESUMED arriving in the same call, and the
+        replay must NOT see the released button — dropping after the flush
+        re-presses it on the wire (sticky button). On a send failure
+        (``ToolError``) the button is restored to the held set when it was
+        held, so the client never claims a release the server did not
+        confirm.
+        """
+        was_held = button in self._held_buttons
         self._held_buttons.discard(button)
+        try:
+            self.pointer_button(button, _RELEASED)
+        except ToolError:
+            if was_held:
+                self._held_buttons.add(button)
+            raise
 
     def pointer_scroll(self, dx: float, dy: float) -> None:
         """Scroll by pixel delta."""
@@ -1293,22 +1322,47 @@ class EISClient:
         Ordinary press+release bursts (key combos, click modifiers) must not
         go through here — they would turn transient presses into eternal
         holds.
+
+        The intent is recorded BEFORE the send (issue #19): the post-send
+        ``_flush`` drains a PAUSED→RESUMED arriving in the same call, and the
+        replay must already see the new keys — recording after the flush
+        misses that same-call recovery and diverges from the server. On a
+        send failure (``ToolError`` from the readiness gate or the flush)
+        the newly added intents roll back, so the client never claims keys
+        the server did not confirm held.
         """
         if not keycodes:
             return
-        self.keyboard_burst([(code, _PRESSED) for code in keycodes])
+        fresh = set(keycodes) - self._held_keys
         self._held_keys.update(keycodes)
+        try:
+            self.keyboard_burst([(code, _PRESSED) for code in keycodes])
+        except ToolError:
+            self._held_keys.difference_update(fresh)
+            raise
 
     def release_keys(self, keycodes: list[int]) -> None:
         """Send key releases and drop them from the held set (issue #233).
 
         Releases in list order (``keyboard_key_up`` passes the main key
         first, then the reversed modifiers).
+
+        The intent is dropped BEFORE the send (issue #19): the post-send
+        ``_flush`` drains a PAUSED→RESUMED arriving in the same call, and the
+        replay must NOT see the released keys — dropping after the flush
+        re-presses them on the wire (sticky modifier). On a send failure
+        (``ToolError``) the previously held intents are restored, so the
+        client never claims a release the server did not confirm.
         """
         if not keycodes:
             return
-        self.keyboard_burst([(code, _RELEASED) for code in keycodes])
+        held_before = set(keycodes) & self._held_keys
         self._held_keys.difference_update(keycodes)
+        try:
+            self.keyboard_burst([(code, _RELEASED) for code in keycodes])
+        except ToolError:
+            self._held_keys.update(held_before)
+            raise
 
     def text_keysym(self, keysym: int, state: int) -> None:
         """Press/release a key by XKB keysym via the EIS text device.
