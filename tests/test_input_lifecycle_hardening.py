@@ -428,6 +428,49 @@ def test_wait_emulating_sees_queued_events_without_select(monkeypatch: Any) -> N
     assert client._emulating_devices == {POINTER, KEYBOARD}
 
 
+def test_wait_emulating_fails_on_queued_disconnect(monkeypatch: Any) -> None:
+    """Dead wait: a drained DISCONNECT beats a full emulation set.
+
+    The readiness probe must not short-circuit on the stale
+    ``_emulating_devices`` after the drain just marked the connection dead —
+    the caller must take the reconnect path (honest delivery).
+    """
+    fake = FakeLibei([(_EI_EVENT_DISCONNECT, 0)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    assert client._emulating_devices == {POINTER, KEYBOARD}
+
+    assert client._wait_emulating(0.05) is False
+    assert client._connection_dead is True
+
+
+def test_wait_emulating_fails_when_disconnect_follows_resumed(
+    monkeypatch: Any,
+) -> None:
+    """Dead wait: RESUMEDs before a queued DISCONNECT still end the wait dead.
+
+    The pre-DISCONNECT RESUMEDs belong to the live connection (F5
+    drain-break semantics — they still start emulation), but the trailing
+    DISCONNECT kills it, so the wait reports False with the dead flag set
+    for the reconnect path.
+    """
+    fake = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_RESUMED, POINTER),
+            (_EI_EVENT_DEVICE_RESUMED, KEYBOARD),
+            (_EI_EVENT_DISCONNECT, 0),
+        ],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._emulating_devices = set()  # paused: the RESUMEDs restart emulation
+
+    assert client._wait_emulating(0.5) is False
+    assert client._connection_dead is True
+    assert [d for d, _ in fake.started] == sorted([POINTER, KEYBOARD])
+
+
 # ── Round 2, W1: one ownership model on every path ────────────────────────
 #
 # Ownership is per slot: ``_register_device`` takes one ``ei_device_ref``

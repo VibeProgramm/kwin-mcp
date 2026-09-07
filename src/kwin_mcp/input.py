@@ -1125,6 +1125,8 @@ class EISClient:
             if self._connection_dead or self._ei == 0:
                 return False
             self._drain_events()
+            if self._connection_dead or self._ei == 0:
+                return False
             if self._required_ready(require_attrs):
                 return True
             if time.monotonic() >= deadline:
@@ -1136,7 +1138,7 @@ class EISClient:
                 if ret < 0:
                     self._connection_dead = True
                     return False
-        return self._required_ready(require_attrs)
+        return self._required_ready(require_attrs) and not self._connection_dead
 
     def _reconnect(self) -> None:
         """Rebuild the EIS connection after the server stopped negotiating.

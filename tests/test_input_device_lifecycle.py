@@ -563,21 +563,30 @@ def test_ensure_devices_ready_reconnect_failure_raises_tool_error(monkeypatch) -
 
 
 def test_disconnect_event_flags_dead_connection_instead_of_raising(monkeypatch) -> None:
-    """DISCONNECT during a drain must not raise; the NEXT injection rebuilds.
+    """DISCONNECT during a drain must not raise; the injection rebuilds first.
 
     Regression for B3: _handle_event used to raise RuntimeError straight out
     of the drain loop, bypassing the reconnect path entirely.
+
+    Contract change (issue #16, dead-wait fix — NOT a test weakening): the
+    pre-send readiness wait drains the queued DISCONNECT itself and fails
+    the wait instead of reporting ready on the stale emulation set, so the
+    SAME injection rebuilds the connection (previously it sent into the dead
+    connection and only the post-send flush flagged it dead for the NEXT
+    injection). No raise, the key is still delivered exactly once, and the
+    connection is healthy afterwards.
     """
     fake = FakeLibei([(_EI_EVENT_DISCONNECT, 0)], {})
     _install(monkeypatch, fake)
     client = _client(fake)
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
-    client.keyboard_key(30, _PRESSED)  # flush drains the DISCONNECT event
-    assert client._connection_dead is True  # flagged, not raised
+    client.keyboard_key(30, _PRESSED)  # wait drains DISCONNECT → reconnect, then send
+    assert setup_calls == [1]
     assert fake.key_calls == [(30, _PRESSED)]
+    assert client._connection_dead is False
 
-    client.keyboard_key(31, _PRESSED)  # readiness wait sees dead → reconnect
+    client.keyboard_key(31, _PRESSED)  # healthy connection: no further reconnect
     assert setup_calls == [1]
     assert fake.key_calls == [(30, _PRESSED), (31, _PRESSED)]
 

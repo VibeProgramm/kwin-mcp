@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - kscreen-doctor flag lines combining several flags (`enabled connected priority 1`) were not recognised (only a bare `enabled` line matched), so such outputs were skipped as disabled; flag lines are now token-parsed with priority extracted from any flag line
 - The inbound event drain (`ei_get_event` → `_handle_event` → unref) was triplicated across the handshake, the readiness wait and the post-send flush; all three share a `_drain_events` helper and the device-slot tuple lives in one `_DEVICE_ATTRS` constant
 - A multi-capability EIS handle occupying several device slots leaked one `ei_device_ref` per extra slot on remove/seat-removal/teardown (two refs taken, one released), and `close()` stopped and unref'd the shared handle twice while leaving an aliased touch slot pointing at the freed handle. Ownership is now uniformly per slot on every path (one ref taken and released per occupied slot; emulation still stopped once per handle), and `close()` reuses the shared teardown, so every cleanup step is individually failure-tolerant instead of aborting on the first error
+- The EIS device-readiness wait probed the stale emulation set right after draining a queued DISCONNECT event, reporting ready on a dead connection so the injection ran into it instead of rebuilding. A dead connection observed after the drain (or at the deadline) now fails the wait, so the caller takes the reconnect path
 
 ### Changed
 
