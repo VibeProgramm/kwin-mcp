@@ -9,6 +9,8 @@ the ``(0, 0)`` no-op fallback.
 
 from __future__ import annotations
 
+import pytest
+
 from kwin_mcp.kwin_windows import WindowGeometry, _parse_payload, resolve_offset
 
 # Exact live probe line from the issue: KCalc on a fractionally scaled desktop.
@@ -60,6 +62,24 @@ def test_parse_mixed_payload_keeps_fractional_and_integral() -> None:
     )
     geometries = _parse_payload(payload)
     assert [g.caption for g in geometries] == ["plasmashell", "KCalc"]
+
+
+def test_parse_infinite_lines_dropped_neighbours_kept() -> None:
+    """Infinite tokens drop only their own line (like NaN/garbage)."""
+    payload = (
+        "OK\nGood\t0,0,100,100\t10,20,100,100\torg.good\nBad\tInfinity,0,10,10\t0,0,10,10\torg.bad"
+    )
+    geometries = _parse_payload(payload)
+    assert [g.caption for g in geometries] == ["Good"]
+
+
+@pytest.mark.parametrize("token", ["Infinity", "-Infinity", "inf", "-inf"])
+def test_parse_infinite_tokens_drop_line(token: str) -> None:
+    """Every infinite spelling drops its line instead of killing the payload."""
+    payload = (
+        f"OK\nBad\t{token},0,10,10\t0,0,10,10\torg.bad\nGood\t0,0,100,100\t10,20,100,100\torg.good"
+    )
+    assert [g.caption for g in _parse_payload(payload)] == ["Good"]
 
 
 def test_parse_malformed_lines_still_dropped() -> None:

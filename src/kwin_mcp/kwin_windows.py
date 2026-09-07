@@ -241,7 +241,7 @@ def _parse_payload(payload: str) -> list[WindowGeometry]:
             client = [_parse_coord(v) for v in client_s.split(",")]
             if len(frame) != 4 or len(client) != 4:
                 continue
-        except (ValueError, InvalidOperation):
+        except (ValueError, InvalidOperation, OverflowError):
             continue
         geometries.append(
             WindowGeometry(
