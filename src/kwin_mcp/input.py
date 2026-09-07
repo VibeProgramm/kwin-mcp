@@ -292,7 +292,11 @@ def _load_libei() -> ctypes.CDLL:
     lib.ei_configure_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     lib.ei_setup_backend_fd.restype = ctypes.c_int
     lib.ei_setup_backend_fd.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    lib.ei_dispatch.restype = ctypes.c_int
+    # ei_dispatch is VOID (libei.h): it returns nothing. Errors are handled
+    # internally (the connection is ei_disconnect()ed) and surface to the
+    # caller only as a synthesized EI_EVENT_DISCONNECT event on the next
+    # dispatch + drain — never as a return code.
+    lib.ei_dispatch.restype = None
     lib.ei_dispatch.argtypes = [ctypes.c_void_p]
     lib.ei_get_event.restype = ctypes.c_void_p
     lib.ei_get_event.argtypes = [ctypes.c_void_p]
@@ -432,7 +436,7 @@ class EISClient:
         # monotonic counter satisfies the per-device reading too (B13).
         self._sequence: int = 0
         self._emulating_devices: set[int] = set()  # devices currently in emulating state
-        self._connection_dead: bool = False  # set on DISCONNECT / dispatch failure
+        self._connection_dead: bool = False  # set on DISCONNECT (dispatch is void)
         self._setup()
 
     def _setup(self) -> None:
@@ -644,13 +648,10 @@ class EISClient:
 
             readable, _, _ = select.select([ei_fd], [], [], 0.3)
             if readable:
-                ret = _get_libei().ei_dispatch(self._ei)
-                if ret < 0:
-                    # Dead socket without a DISCONNECT event: mark the
-                    # connection invalid so the next injection rebuilds it
-                    # instead of sending into a void (B3).
-                    self._connection_dead = True
-                    break
+                # ei_dispatch is void: no return code to inspect. A dead
+                # socket surfaces only as a DISCONNECT event, guaranteed to
+                # be synthesized by libei on this dispatch and drained below.
+                _get_libei().ei_dispatch(self._ei)
 
             self._drain_events()
 
@@ -658,11 +659,11 @@ class EISClient:
                 break
 
         if self._connection_dead:
-            # DISCONNECT (or a dispatch failure) arrived mid-handshake: the
-            # registered slots are stale handles of a dead connection, so the
-            # handshake must fail instead of reporting success on them
-            # (issue #16, F5). The wrapper tears the half-state down.
-            msg = "EIS connection lost during handshake (DISCONNECT or dispatch failure)"
+            # A DISCONNECT event arrived mid-handshake: the registered slots
+            # are stale handles of a dead connection, so the handshake must
+            # fail instead of reporting success on them (issue #16, F5).
+            # The wrapper tears the half-state down.
+            msg = "EIS connection lost during handshake (DISCONNECT event)"
             raise RuntimeError(msg)
         if not self._pointer:
             msg = "No pointer device available from EIS"
@@ -1111,8 +1112,10 @@ class EISClient:
         pointer + keyboard alone and report ready before those events are
         ever processed, and selecting first would burn up to 50ms before
         already-queued events are even seen (issue #16, F8). A dead
-        connection (DISCONNECT event or failed dispatch) makes the
-        wait fail immediately so the caller takes the reconnect path.
+        connection (DISCONNECT event) makes the wait fail immediately so the
+        caller takes the reconnect path. ``ei_dispatch`` is void — there is
+        no return code to inspect; a dead socket surfaces only as the
+        DISCONNECT that libei synthesizes on the next dispatch + drain.
 
         A NULL (0) EI context fails the wait immediately too (F1): a failed
         reconnect leaves ``_ei == 0``, and probing libei with it
@@ -1134,10 +1137,9 @@ class EISClient:
             ei_fd = _get_libei().ei_get_fd(self._ei)
             readable, _, _ = select.select([ei_fd], [], [], 0.05)
             if readable:
-                ret = _get_libei().ei_dispatch(self._ei)
-                if ret < 0:
-                    self._connection_dead = True
-                    return False
+                # Void dispatch (libei 1.6): nothing to inspect; a synthesized
+                # DISCONNECT is observed by the next loop's drain.
+                _get_libei().ei_dispatch(self._ei)
         return self._required_ready(require_attrs) and not self._connection_dead
 
     def _reconnect(self) -> None:
@@ -1169,16 +1171,18 @@ class EISClient:
 
         Draining processes device pause/resume/remove events so our
         emulation bookkeeping stays in sync with the server between
-        injections. A negative ``ei_dispatch`` return (dead socket without a
-        DISCONNECT event) marks the connection dead and raises ToolError
-        (issue #234): the caller's events were already queued into libei, so
-        delivery is unconfirmed — the operation must surface as a failure to
-        the MCP client instead of a silent success (at-most-once). The next
-        injection's readiness check sees the dead flag and rebuilds the
-        connection. A DISCONNECT event drained here is NOT a dispatch
-        failure: ``ei_dispatch`` itself succeeded, so the established
-        contract stands — flag the dead connection, let the next injection
-        rebuild, do not raise.
+        injections. ``ei_dispatch`` is void (libei 1.6): there is no return
+        code to branch on — a dead socket surfaces as the DISCONNECT event
+        that libei synthesizes into the queue, and the drain below is what
+        observes it. A DISCONNECT drained here means this operation's
+        events were already handed to libei but delivery is unconfirmed:
+        raise ToolError instead of reporting a silent success (honest
+        delivery, issue #234 on the real API). The next injection's
+        readiness check sees the dead flag and rebuilds the connection.
+
+        Pre-send drains (the readiness gate) stay non-raising: nothing has
+        been sent yet, so a DISCONNECT observed there only fails the wait
+        and the caller takes the reconnect path.
 
         Only the post-send injection paths call this method; the cleanup
         paths (``_teardown_connection`` → ``_invalidate_touches``, ``close``)
@@ -1193,9 +1197,9 @@ class EISClient:
         injection runs.)
 
         Raises:
-            ToolError: when ``ei_dispatch`` fails after this operation's
-                events were sent — delivery is unconfirmed — or when the EI
-                context is already released.
+            ToolError: when the post-send drain observed the connection's
+                DISCONNECT — the events were sent but delivery is
+                unconfirmed — or when the EI context is already released.
         """
         if self._ei == 0:
             self._connection_dead = True
@@ -1203,14 +1207,14 @@ class EISClient:
                 "EIS context is released (no live connection); the injection "
                 "was not delivered — the next call rebuilds the connection."
             )
-        if _get_libei().ei_dispatch(self._ei) < 0:
-            self._connection_dead = True
-            tool_error(
-                "input delivery failed; EIS connection lost (dispatch error) — "
-                "the event was sent but delivery is unconfirmed; the next call "
-                "rebuilds the connection and delivers."
-            )
+        _get_libei().ei_dispatch(self._ei)
         self._drain_events()
+        if self._connection_dead:
+            tool_error(
+                "input delivery failed; EIS connection lost (disconnect) — "
+                "delivery unconfirmed; the next call rebuilds the connection "
+                "and delivers."
+            )
 
     def pointer_move_absolute(self, x: float, y: float) -> None:
         """Move pointer to absolute coordinates."""
