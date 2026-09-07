@@ -1,0 +1,11 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.VibeProgramm/kwin-mcp",
+  "description": "KDE Plasma 6 Wayland GUI automation for AI agents: 30 tools (EIS input, screenshots, AT-SPI2).",
+  "repository": {
+    "url": "https://github.com/VibeProgramm/kwin-mcp",
+    "source": "github"
+  },
+  "version": "0.8.1",
+  "title": "kwin-mcp"
+}
