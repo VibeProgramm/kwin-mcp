@@ -1979,6 +1979,10 @@ def test_pause_cycle_exhausts_attempts_into_clean_tool_error(monkeypatch: Any) -
     assert client._emulating_devices == set()
     # No injection was sent into a paused device.
     assert all(f.key_calls == [] for f in fresh)
+    # Attempt 2 of #235: with no held state the reset-on-exhaustion path is
+    # a no-op — the ordinary retry path's contract is unchanged.
+    assert client._held_keys == set()
+    assert client._held_buttons == set()
 
 
 def test_ensure_devices_ready_first_stall_wait_is_half_second(monkeypatch: Any) -> None:
@@ -2031,3 +2035,134 @@ def test_ensure_devices_ready_happy_path_no_reconnect(monkeypatch: Any) -> None:
     assert fake.key_calls == [(30, _PRESSED)]
     assert fake.frames == [KEYBOARD]
     assert client._pointer == POINTER  # same, untouched connection
+
+
+# ── Issue #235 attempt 2: held-state reset on reconnect budget exhaustion ──
+#
+# Live evidence (probe10, ei-debug10.log, 13 reconnects): with shift held
+# (keyboard_key_down delivered), EVERY fresh handshake's RESUMED replays the
+# held modifier press (_replay_held_state, #233) — and this KWin build pauses
+# its devices again in response to the replayed modifier press. Each retry
+# attempt therefore re-enters the pause cycle through the replay itself:
+# attempt 1 → handshake → replayed press → PAUSED → attempt 2 → ... → the
+# budget exhausts into a ToolError, and the NEXT call repeats the whole
+# pattern forever (the held set still holds the key that was never released).
+#
+# The libei API contract breaks the loop: after PAUSED the server has already
+# reset its logical state to neutral ("any buttons or keys logically down are
+# released"). When the reconnect budget is exhausted the client's held sets
+# are therefore guaranteed-stale — clearing them aligns the client with the
+# server. The next call's fresh handshake then has nothing to replay, the
+# devices stay emulating, and delivery works again. This is a reconciliation,
+# not a silent loss: the ToolError explicitly reports the reset.
+
+
+def test_pause_cycle_with_held_key_resets_held_state_on_exhaustion(
+    monkeypatch: Any,
+) -> None:
+    """(a) Held shift + full pause cycle → ToolError, held sets cleared.
+
+    Every reconnect attempt replays the held modifier press (the #233 replay
+    is correct per attempt) and the server re-pauses. When the budget
+    exhausts, the client must reconcile with the server's neutral state:
+    ``_held_keys``/``_held_buttons`` are cleared, the connection is torn down
+    (``_ei == 0``), and the ToolError names the reset so the calling agent
+    knows to re-press the modifier.
+    """
+    client, _stale, fresh = _pause_cycle_setup(monkeypatch, fresh_count=3, pause_cycles=3)
+    client._held_keys.add(42)  # shift, as delivered by keyboard_key_down
+    client._held_buttons.add(0x110)
+
+    with pytest.raises(ToolError, match="after 3 reconnect attempts") as exc_info:
+        client.keyboard_key(30, _PRESSED)
+    message = str(exc_info.value).lower()
+    assert "held" in message
+    assert "reset" in message
+
+    # Reconciliation: the server is in neutral after the pauses (libei PAUSED
+    # releases all logically-down keys/buttons), so the client's held sets
+    # must be empty — a phantom replay would re-enter the pause loop forever.
+    assert client._held_keys == set()
+    assert client._held_buttons == set()
+    # Clean slate for the next call (F1): no context left to probe.
+    assert client._ei == 0
+    # The #233 replay still ran per attempt BEFORE the reset (not weakened):
+    # each of the three fresh handshakes replayed the held press.
+    replayed = [f.key_calls for f in fresh]
+    assert replayed == [[(42, _PRESSED)], [(42, _PRESSED)], [(42, _PRESSED)]]
+
+
+def test_call_after_exhaustion_delivers_without_replay_or_new_pauses(
+    monkeypatch: Any,
+) -> None:
+    """(b) The loop is broken: the call after the ToolError recovers cleanly.
+
+    Continuing (a): the 4th fresh connection keeps its devices emulating
+    after the handshake (no re-pause queued — the live shape once nothing
+    replays a modifier press). The next readiness gate reconnects exactly
+    once and succeeds, and — critically — the fresh handshake carries NO
+    replayed press (the held sets were cleared): the gate itself injects
+    nothing, so the fresh fake logs zero key calls.
+    """
+    client, _stale, fresh = _pause_cycle_setup(monkeypatch, fresh_count=4, pause_cycles=3)
+    client._held_keys.add(42)
+
+    with pytest.raises(ToolError, match="after 3 reconnect attempts"):
+        client.keyboard_key(30, _PRESSED)
+    assert client._held_keys == set()
+    assert client._held_buttons == set()
+    assert client._ei == 0
+
+    client._ensure_devices_ready(timeout_s=0.05)
+
+    # First attempt of the next call succeeded: one more fresh handshake
+    # (the 4th, context 104) whose devices stayed emulating — no new pause.
+    assert client._ei == 104
+    assert client._pointer == NEW_POINTER
+    assert client._keyboard == NEW_KEYBOARD
+    assert client._emulating_devices == {NEW_POINTER, NEW_KEYBOARD}
+    # No replayed press: the fresh handshake's key log holds only user
+    # injections — and the gate injects nothing, so zero key calls.
+    assert fresh[3].key_calls == []
+    # The fresh connection stayed alive (no teardown after success).
+    assert fresh[3].unrefed_ei == []
+
+
+def test_exhaustion_without_held_state_reports_no_reset(monkeypatch: Any) -> None:
+    """(c) Empty held sets → exhaustion keeps the original message shape.
+
+    The held-reset clause only appears when there was held state to clear;
+    the plain retry path (#235 attempt 1) keeps its exact contract.
+    """
+    client, _stale, _fresh = _pause_cycle_setup(monkeypatch, fresh_count=3, pause_cycles=3)
+
+    with pytest.raises(ToolError, match="after 3 reconnect attempts") as exc_info:
+        client.keyboard_key(30, _PRESSED)
+    assert "held" not in str(exc_info.value)
+
+    assert client._held_keys == set()
+    assert client._held_buttons == set()
+    assert client._ei == 0
+
+
+def test_success_on_retry_attempt_with_held_state_keeps_it(monkeypatch: Any) -> None:
+    """(d) Delivery on the k-th attempt with held state → held sets survive.
+
+    The #233 replay contract is not weakened: between attempts the replay
+    must keep working, and a successful recovery must NOT clear held state —
+    the reset is reserved for budget exhaustion only.
+    """
+    client, _stale, fresh = _pause_cycle_setup(monkeypatch, fresh_count=3, pause_cycles=2)
+    client._held_keys.add(42)
+    client._held_buttons.add(0x110)
+
+    client.keyboard_key(30, _PRESSED)  # 3rd connection stays emulating → delivered
+
+    # Held state survives the successful recovery (replay restored the
+    # modifier server-side; the pairing keyboard_key_up is still pending).
+    assert client._held_keys == {42}
+    assert client._held_buttons == {0x110}
+    # The replay ran on the successful connection too (before the injection).
+    assert fresh[2].key_calls == [(42, _PRESSED), (30, _PRESSED)]
+    # The exhausted-connection teardown did not happen (still alive).
+    assert fresh[2].unrefed_ei == []

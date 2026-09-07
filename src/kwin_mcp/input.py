@@ -917,6 +917,18 @@ class EISClient:
         or NULL device is exactly what this gate exists to prevent.
         (A failed reconnect raises inside ``_reconnect`` and never reaches
         the re-check.)
+
+        Wingman #235 attempt 2: when the budget is exhausted, the held
+        key/button sets (issue #233) are cleared if non-empty and the
+        ToolError names the reset. Per the libei API every PAUSED reset the
+        logical state to neutral, so after a lost battle against the pause
+        cycle the server holds nothing logically down — the client sets are
+        guaranteed stale, and replaying them on the next fresh handshake
+        would restart the cycle (a replayed modifier press pauses this KWin
+        build again). With the sets cleared, the next call's fresh handshake
+        carries no replayed press and the devices stay emulating. The reset
+        clause is only added to the message when held state actually
+        existed; the plain exhaustion message is unchanged.
         """
         if self._wait_emulating(timeout_s, require_attrs):
             return
@@ -936,6 +948,33 @@ class EISClient:
             for attr in require_attrs
             if not self._device_emulating(getattr(self, attr))
         )
+        # Wingman #235 attempt 2: reconcile the held state with the server.
+        # Per the libei API, PAUSED resets the logical state to neutral ("any
+        # buttons or keys logically down are released") and every failed
+        # attempt ended in a pause — the server is neutral now, so the held
+        # sets are guaranteed stale. Replaying them on the NEXT call's fresh
+        # handshake would re-enter the pause cycle forever (observed live:
+        # every replayed modifier press pauses this KWin build again, so the
+        # budget exhausted on every call once a held state existed). Clearing
+        # is a reconciliation, not a silent loss: the ToolError below names
+        # the reset, and the next call's fresh handshake carries no replayed
+        # press — the devices stay emulating and delivery recovers.
+        if self._held_keys or self._held_buttons:
+            _ei_debug(
+                "held keys/buttons reset after reconnect budget exhaustion "
+                f"(keys={sorted(self._held_keys)}, buttons={sorted(self._held_buttons)}); "
+                "the server is already in neutral state"
+            )
+            self._held_keys.clear()
+            self._held_buttons.clear()
+            tool_error(
+                f"EIS did not restore the requested input devices "
+                f"({missing or 'pointer/keyboard'}) after {_RECONNECT_ATTEMPTS} "
+                "reconnect attempts; injection aborted instead of being silently "
+                "dropped into a paused device. Held key/button state was reset "
+                "(the server released all logically down input on pause) — "
+                "re-press the modifier/button if it is still needed."
+            )
         tool_error(
             f"EIS did not restore the requested input devices "
             f"({missing or 'pointer/keyboard'}) after {_RECONNECT_ATTEMPTS} "
