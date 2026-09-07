@@ -77,24 +77,35 @@ def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
             geometry = None
             # Some kscreen-doctor versions put the flags on the "Output:"
             # line itself ("Output: 1 eDP-1 enabled connected priority 1");
-            # others print them as indented follow-up lines.
+            # others print them as indented follow-up lines, either one flag
+            # per line or combined ("enabled connected priority 1").
             rest = line[len("Output:") :]
-            if "enabled" in rest.split():
+            tokens = rest.split()
+            if "enabled" in tokens:
                 enabled = True
+            elif "disabled" in tokens:
+                enabled = False
             prio_match = re.search(r"priority\s+(\d+)", rest)
             if prio_match:
                 priority = int(prio_match.group(1))
-        elif line == "enabled":
-            enabled = True
-        elif line.startswith("priority "):
-            try:
-                priority = int(line.split()[-1])
-            except ValueError:
-                priority = 0
         elif line.startswith("Geometry:"):
             match = re.search(r"\b(\d+)x(\d+)\b", line)
             if match:
                 geometry = (int(match.group(1)), int(match.group(2)))
+        else:
+            # Generic flag line: may hold a bare flag ("enabled"), a combined
+            # set ("enabled connected priority 1"), or just a priority.
+            tokens = line.split()
+            if "enabled" in tokens:
+                enabled = True
+            elif "disabled" in tokens:
+                enabled = False
+            prio_match = re.search(r"priority\s+(\d+)", line)
+            if prio_match:
+                try:
+                    priority = int(prio_match.group(1))
+                except ValueError:
+                    priority = 0
     finish_block()
     return best
 
@@ -354,9 +365,12 @@ class AutomationEngine:
             tool_error("Session already running. Call session_stop first.")
 
         # Auto-detect the visible desktop size when not explicitly requested.
-        # 0 means "match the current desktop"; detection runs at every call
-        # so a changed desktop size is applied to the next virtual session
-        # (adopted from 01SW/kwin-mcp).
+        # 0 in either dimension means "match the current desktop": both
+        # dimensions are resolved together from detection, so a partially
+        # zero request (e.g. 0x720) does not mix a detected width with a
+        # caller height into a nonsensical aspect ratio. Detection runs at
+        # every call so a changed desktop size is applied to the next
+        # virtual session (adopted from 01SW/kwin-mcp).
         if screen_width <= 0 or screen_height <= 0:
             screen_width, screen_height = _detect_physical_screen_size()
 

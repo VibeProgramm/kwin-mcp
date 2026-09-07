@@ -56,14 +56,16 @@ async def session_start(
         int,
         Field(
             description="Virtual screen width in pixels. 0 or omitted = auto-detect "
-            "the visible (logical) desktop size (measured at session start)."
+            "the visible (logical) desktop size (measured at session start). "
+            "0 in either dimension auto-detects both dimensions."
         ),
     ] = 0,
     screen_height: Annotated[
         int,
         Field(
             description="Virtual screen height in pixels. 0 or omitted = auto-detect "
-            "the visible (logical) desktop size (measured at session start)."
+            "the visible (logical) desktop size (measured at session start). "
+            "0 in either dimension auto-detects both dimensions."
         ),
     ] = 0,
     enable_clipboard: Annotated[

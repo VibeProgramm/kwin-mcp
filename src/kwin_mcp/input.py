@@ -160,6 +160,16 @@ _EI_EVENT_DEVICE_PAUSED = 9
 # Scroll axis values (in libei, scroll is in pixels)
 _SCROLL_STEP_PIXELS = 15.0
 
+# Slot attributes holding the negotiated EIS device handles. The tuple
+# travels together wherever devices are dropped or released, so it lives in
+# one place instead of being repeated at every teardown site.
+_DEVICE_ATTRS: tuple[str, str, str, str] = (
+    "_pointer",
+    "_keyboard",
+    "_touch_device",
+    "_text_device",
+)
+
 # XKB keysyms for control characters (XK_Return, XK_Tab)
 _XKB_KEYSYM_RETURN = 0xFF0D
 _XKB_KEYSYM_TAB = 0xFF09
@@ -439,7 +449,7 @@ class EISClient:
         # cookie must not leak into the fresh handshake after a rebuild.
         self._cookie = 0
         self._invalidate_touches()
-        for attr in ("_touch_device", "_text_device", "_pointer", "_keyboard"):
+        for attr in _DEVICE_ATTRS:
             existing = getattr(self, attr)
             if existing:
                 # Started devices must stop emulating before release.
@@ -520,12 +530,7 @@ class EISClient:
                     self._connection_dead = True
                     break
 
-            while True:
-                event = _get_libei().ei_get_event(self._ei)
-                if not event:
-                    break
-                self._handle_event(event)
-                _get_libei().ei_event_unref(event)
+            self._drain_events()
 
             if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
                 break
@@ -588,7 +593,7 @@ class EISClient:
         """
         _ei_debug("seat removed; dropping all devices")
         self._invalidate_touches()
-        for attr in ("_pointer", "_keyboard", "_touch_device", "_text_device"):
+        for attr in _DEVICE_ATTRS:
             device = getattr(self, attr)
             if device:
                 self._emulating_devices.discard(device)
@@ -630,6 +635,36 @@ class EISClient:
     def _device_emulating(self, device: int) -> bool:
         """Whether the given device is registered and in emulating state."""
         return device != 0 and device in self._emulating_devices
+
+    def _drain_events(self) -> None:
+        """Pop every queued inbound event through the central dispatcher.
+
+        Shared by the handshake, the readiness wait and the post-send flush
+        so PAUSED/REMOVED/RESUMED transitions are processed wherever they
+        arrive instead of sitting queued until the next deadline.
+        """
+        while True:
+            event = _get_libei().ei_get_event(self._ei)
+            if not event:
+                break
+            self._handle_event(event)
+            _get_libei().ei_event_unref(event)
+
+    def _required_ready(self, require_attrs: tuple[str, ...] = ()) -> bool:
+        """Whether pointer + keyboard (plus any extra named slots) emulate.
+
+        Extra slots holding 0 (device not negotiated, e.g. no touch device
+        and pointer fallback in use) are skipped: there is nothing to wait
+        for. Slot handles are re-read on every call so a reconnect that
+        replaced the devices is observed immediately.
+        """
+        if not (self._device_emulating(self._pointer) and self._device_emulating(self._keyboard)):
+            return False
+        return all(
+            self._device_emulating(getattr(self, attr))
+            for attr in require_attrs
+            if getattr(self, attr)
+        )
 
     @property
     def has_text_device(self) -> bool:
@@ -718,7 +753,7 @@ class EISClient:
         # Whether the removed device occupies the touch slot, checked BEFORE
         # the loop clears the slots (comparing after would always see 0).
         was_touch_device = device != 0 and device == self._touch_device
-        for attr in ("_pointer", "_keyboard", "_touch_device", "_text_device"):
+        for attr in _DEVICE_ATTRS:
             if getattr(self, attr) == device:
                 setattr(self, attr, 0)
                 self._emulating_devices.discard(device)
@@ -730,8 +765,17 @@ class EISClient:
         """Current time in microseconds."""
         return int(time.monotonic() * 1_000_000)
 
-    def _ensure_devices_ready(self, timeout_s: float = 5.0) -> None:
+    def _ensure_devices_ready(
+        self, timeout_s: float = 5.0, require_attrs: tuple[str, ...] = ()
+    ) -> None:
         """Wait until pointer + keyboard are emulating, reconnecting on failure.
+
+        Callers driving the text or touch device pass it via ``require_attrs``
+        (e.g. ``("_text_device",)``): a paused text/touch device would
+        otherwise accept the readiness short-circuit on pointer + keyboard
+        alone and the injection would be silently dropped. Slot handles are
+        resolved fresh on every poll, so a reconnect inside the wait is
+        observed immediately.
 
         This check is best-effort: KWin may pause or remove its devices
         between the readiness check and the actual event injection, and such
@@ -748,7 +792,7 @@ class EISClient:
         reconnect guarantees emulating devices, because ``_setup`` runs the
         device negotiation itself and raises on failure.
         """
-        if self._wait_emulating(timeout_s):
+        if self._wait_emulating(timeout_s, require_attrs):
             return
         _ei_debug("devices stalled; reconnecting EIS")
         try:
@@ -756,8 +800,8 @@ class EISClient:
         except (ToolError, RuntimeError) as exc:
             tool_error(f"EIS reconnect failed: {exc}")
 
-    def _wait_emulating(self, timeout_s: float) -> bool:
-        """Wait until pointer + keyboard are emulating, draining events.
+    def _wait_emulating(self, timeout_s: float, require_attrs: tuple[str, ...] = ()) -> bool:
+        """Wait until pointer + keyboard (+ extra slots) emulate, draining events.
 
         The queue is drained on every iteration (not only when the fd is
         readable): events queued by a previous dispatch would otherwise sit
@@ -775,7 +819,7 @@ class EISClient:
         while time.monotonic() < deadline:
             if self._connection_dead or self._ei == 0:
                 return False
-            if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
+            if self._required_ready(require_attrs):
                 return True
             ei_fd = _get_libei().ei_get_fd(self._ei)
             readable, _, _ = select.select([ei_fd], [], [], 0.05)
@@ -784,13 +828,8 @@ class EISClient:
                 if ret < 0:
                     self._connection_dead = True
                     return False
-            while True:
-                event = _get_libei().ei_get_event(self._ei)
-                if not event:
-                    break
-                self._handle_event(event)
-                _get_libei().ei_event_unref(event)
-        return False
+            self._drain_events()
+        return self._required_ready(require_attrs)
 
     def _reconnect(self) -> None:
         """Rebuild the EIS connection after the server stopped negotiating.
@@ -836,12 +875,7 @@ class EISClient:
         if _get_libei().ei_dispatch(self._ei) < 0:
             self._connection_dead = True
             return
-        while True:
-            event = _get_libei().ei_get_event(self._ei)
-            if not event:
-                break
-            self._handle_event(event)
-            _get_libei().ei_event_unref(event)
+        self._drain_events()
 
     def pointer_move_absolute(self, x: float, y: float) -> None:
         """Move pointer to absolute coordinates."""
@@ -908,7 +942,7 @@ class EISClient:
         if not self._text_device:
             msg = "No EIS text device available (libei >= 1.6 required)"
             raise RuntimeError(msg)
-        self._ensure_devices_ready()
+        self._ensure_devices_ready(require_attrs=("_text_device",))
         _get_libei().ei_device_text_keysym(self._text_device, keysym, state)
         _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
@@ -921,14 +955,14 @@ class EISClient:
         if not self._text_device:
             msg = "No EIS text device available (libei >= 1.6 required)"
             raise RuntimeError(msg)
-        self._ensure_devices_ready()
+        self._ensure_devices_ready(require_attrs=("_text_device",))
         _get_libei().ei_device_text_utf8(self._text_device, text.encode("utf-8"))
         _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
 
     def touch_down(self, x: float, y: float) -> int:
         """Start a new touch at (x, y). Returns a touch ID."""
-        self._ensure_devices_ready()
+        self._ensure_devices_ready(require_attrs=("_touch_device",))
         device = self._touch_device or self._pointer
         touch = _get_libei().ei_device_touch_new(device)
         if not touch:
@@ -957,7 +991,7 @@ class EISClient:
         active gesture; a gesture cannot be continued across one — start a
         new touch instead.
         """
-        self._ensure_devices_ready()
+        self._ensure_devices_ready(require_attrs=("_touch_device",))
         touch = self._active_touches.get(touch_id)
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
@@ -977,7 +1011,7 @@ class EISClient:
         first would both skip that cleanup and leave the method holding a
         dangling pointer for its own ``ei_touch_up``.
         """
-        self._ensure_devices_ready()
+        self._ensure_devices_ready(require_attrs=("_touch_device",))
         touch = self._active_touches.pop(touch_id, None)
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
@@ -1071,10 +1105,11 @@ class InputBackend:
         self.mouse_move(x, y)
         time.sleep(0.02)
 
-        # Press modifier keys
-        for mod in mod_codes:
-            self._client.keyboard_key(mod, _PRESSED)
-            time.sleep(0.01)
+        # Batch modifier presses into one frame: a combo spread over several
+        # frames lets KWin pause the keyboard device mid-press and drop the
+        # remaining strokes (same rationale as keyboard_burst for key combos).
+        if mod_codes:
+            self._client.keyboard_burst([(mod, _PRESSED) for mod in mod_codes])
 
         for i in range(click_count):
             if i > 0:
@@ -1086,10 +1121,9 @@ class InputBackend:
                 time.sleep(0.01)
             self._client.pointer_button(btn_code, _RELEASED)
 
-        # Release modifier keys in reverse order
-        for mod in reversed(mod_codes):
-            time.sleep(0.01)
-            self._client.keyboard_key(mod, _RELEASED)
+        # Release modifier keys in reverse order, again as a single frame.
+        if mod_codes:
+            self._client.keyboard_burst([(mod, _RELEASED) for mod in reversed(mod_codes)])
 
     def mouse_scroll(
         self,
@@ -1164,10 +1198,10 @@ class InputBackend:
         self.mouse_move(from_x, from_y)
         time.sleep(0.05)
 
-        # Press modifier keys
-        for mod in mod_codes:
-            self._client.keyboard_key(mod, _PRESSED)
-            time.sleep(0.01)
+        # Batch modifier presses into one frame (same rationale as in
+        # mouse_click: KWin may pause mid-press otherwise).
+        if mod_codes:
+            self._client.keyboard_burst([(mod, _PRESSED) for mod in mod_codes])
 
         self._client.pointer_button(btn_code, _PRESSED)
         time.sleep(0.02)
@@ -1197,10 +1231,9 @@ class InputBackend:
         time.sleep(0.02)
         self._client.pointer_button(btn_code, _RELEASED)
 
-        # Release modifier keys in reverse order
-        for mod in reversed(mod_codes):
-            time.sleep(0.01)
-            self._client.keyboard_key(mod, _RELEASED)
+        # Release modifier keys in reverse order, again as a single frame.
+        if mod_codes:
+            self._client.keyboard_burst([(mod, _RELEASED) for mod in reversed(mod_codes)])
 
     def mouse_button_down(self, x: int, y: int, button: MouseButton = MouseButton.LEFT) -> None:
         """Move to coordinates and press a mouse button without releasing.
@@ -1330,13 +1363,12 @@ class InputBackend:
         """
         modifiers, keycode = _parse_key_combo(key)
 
-        for mod in modifiers:
-            self._client.keyboard_key(mod, _PRESSED)
-            time.sleep(0.01)
-
+        # Single frame like _press_key_combo: KWin may pause mid-press.
+        pairs = [(mod, _PRESSED) for mod in modifiers]
         if keycode is not None:
-            self._client.keyboard_key(keycode, _PRESSED)
-            time.sleep(0.01)
+            pairs.append((keycode, _PRESSED))
+        if pairs:
+            self._client.keyboard_burst(pairs)
 
     def keyboard_key_up(self, key: str) -> None:
         """Release a previously pressed key combination.
@@ -1348,13 +1380,12 @@ class InputBackend:
         """
         modifiers, keycode = _parse_key_combo(key)
 
+        pairs: list[tuple[int, int]] = []
         if keycode is not None:
-            self._client.keyboard_key(keycode, _RELEASED)
-            time.sleep(0.01)
-
-        for mod in reversed(modifiers):
-            self._client.keyboard_key(mod, _RELEASED)
-            time.sleep(0.01)
+            pairs.append((keycode, _RELEASED))
+        pairs.extend((mod, _RELEASED) for mod in reversed(modifiers))
+        if pairs:
+            self._client.keyboard_burst(pairs)
 
     def touch_tap(self, x: int, y: int, hold_ms: int = 0) -> None:
         """Tap at the given coordinates.

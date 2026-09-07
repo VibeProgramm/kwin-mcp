@@ -159,6 +159,48 @@ def test_detect_kscreen_doctor_no_enabled_outputs_falls_through(monkeypatch) -> 
     assert _detect_physical_screen_size() == _DEFAULT_VIRTUAL_SIZE
 
 
+def test_detect_kscreen_doctor_combined_flags_line(monkeypatch) -> None:
+    """Flags combined on one follow-up line are recognised (review follow-up).
+
+    Some kscreen-doctor versions print ``enabled connected priority 1`` as a
+    single indented line instead of one flag per line; the old parser only
+    matched a bare ``enabled`` line and skipped such outputs as disabled.
+    """
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1\n"
+            "enabled connected priority 1\n"
+            "Geometry: 0,0 1920x1080\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (1920, 1080)
+
+
+def test_detect_kscreen_doctor_disabled_token_wins(monkeypatch) -> None:
+    """An explicit disabled token keeps the output out of the race."""
+    monkeypatch.setattr(
+        core_module.shutil,
+        "which",
+        _which(monkeypatch, {"kscreen-doctor": "/usr/bin/kscreen-doctor"}),
+    )
+    monkeypatch.setattr(
+        core_module.subprocess,
+        "run",
+        lambda *a, **k: _run_result(
+            "Output: 1 DP-1\ndisabled connected\nGeometry: 0,0 1920x1080\n"
+            "Output: 2 eDP-1\nenabled connected\nGeometry: 0,0 1280x720\n"
+        ),
+    )
+    assert _detect_physical_screen_size() == (1280, 720)
+
+
 def test_detect_falls_back_to_xrandr_primary(monkeypatch) -> None:
     """No kscreen-doctor → xrandr primary monitor line is parsed."""
     monkeypatch.setattr(
@@ -293,7 +335,7 @@ class _LazySession:
         return getattr(self._holder["session"], name)
 
 
-def _engine(monkeypatch, detected: tuple[int, int]) -> tuple[AutomationEngine, _LazySession]:
+def _engine(monkeypatch: Any, detected: tuple[int, int]) -> tuple[AutomationEngine, _LazySession]:
     """An engine with detection, session and input backend faked out.
 
     core.py constructs ``Session()`` itself, so the stub is installed as a

@@ -250,13 +250,13 @@ def _client(fake: FakeLibei) -> EISClient:
     return client
 
 
-def _install(monkeypatch, fake: FakeLibei) -> None:
+def _install(monkeypatch: Any, fake: FakeLibei) -> None:
     monkeypatch.setattr(input_module, "_get_libei", lambda: fake)
     # Never readable: the wait loop still drains the event queue below.
     monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
 
 
-def _reconnecting_setup(client: EISClient, emulating: bool):
+def _reconnecting_setup(client: EISClient, emulating: bool) -> tuple[Any, list[int]]:
     """Build a _setup stub simulating a fresh handshake after _reconnect.
 
     Mirrors the real ``_setup`` contract: a fresh, non-zero EI context is
@@ -1037,3 +1037,104 @@ def test_seat_removed_invalidates_active_touches(monkeypatch) -> None:
     assert fake.unrefed_touches == [0x888]
     assert client._active_touches == {}
     assert client._next_touch_id == 0
+
+
+# ── Review follow-ups: extra-slot gating + burst modifiers ────────────────
+
+
+def test_wait_emulating_require_text_device(monkeypatch: Any) -> None:
+    """Pointer + keyboard ready is NOT enough when the text slot is required.
+
+    Regression for the review finding: text injections gated only on
+    pointer + keyboard, so a paused text device silently dropped input.
+    """
+    from kwin_mcp.input import _EI_CAP_TEXT
+
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._text_device = 0x104
+
+    assert client._wait_emulating(0.05) is True
+    assert client._wait_emulating(0.05, ("_text_device",)) is False
+
+
+def test_wait_emulating_require_text_device_resumed(monkeypatch: Any) -> None:
+    """A RESUMED text event satisfies the extra-slot requirement."""
+    from kwin_mcp.input import _EI_CAP_TEXT
+
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_RESUMED, 0x104)],
+        {0x104: {_EI_CAP_TEXT}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._text_device = 0x104
+    client._emulating_devices = {POINTER, KEYBOARD}
+
+    assert client._wait_emulating(0.5, ("_text_device",)) is True
+    assert 0x104 in client._emulating_devices
+
+
+def test_drain_events_shared_helper(monkeypatch: Any) -> None:
+    """_drain_events processes pause/resume transitions in one place."""
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    client._drain_events()
+
+    # Pause then resume: net effect is emulating, stop/start each called once.
+    assert POINTER in client._emulating_devices
+    assert fake.stopped == [POINTER]
+    assert [d for d, _ in fake.started] == [POINTER]
+
+
+def test_mouse_click_modifiers_use_burst(monkeypatch: Any) -> None:
+    """mouse_click batches modifier presses/releases (no per-key frames)."""
+    from kwin_mcp.input import InputBackend
+
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = InputBackend.__new__(InputBackend)
+    backend._client = client
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(input_module.time, "sleep", lambda *_: None)
+        backend.mouse_click(10, 20, modifiers=["ctrl", "shift"])
+
+    # Two keyboard frames total: press burst + release burst; the pointer
+    # button frames sit in between.
+    assert fake.key_calls == [
+        (29, _PRESSED),
+        (42, _PRESSED),
+        (42, _RELEASED),
+        (29, _RELEASED),
+    ]
+    assert fake.frames.count(KEYBOARD) == 2
+
+
+def test_keyboard_hold_uses_single_burst(monkeypatch: Any) -> None:
+    """keyboard_key_down/up batch the whole hold set into one frame each."""
+    from kwin_mcp.input import InputBackend
+
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = InputBackend.__new__(InputBackend)
+    backend._client = client
+
+    backend.keyboard_key_down("ctrl+shift")
+    backend.keyboard_key_up("ctrl+shift")
+
+    assert fake.key_calls == [
+        (29, _PRESSED),
+        (42, _PRESSED),
+        (42, _RELEASED),
+        (29, _RELEASED),
+    ]
+    assert fake.frames == [KEYBOARD, KEYBOARD]
