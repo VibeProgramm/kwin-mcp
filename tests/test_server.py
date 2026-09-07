@@ -107,11 +107,14 @@ def test_server_info_version_is_reported() -> None:
     """The MCP serverInfo carries the installed package version (A5).
 
     The SDK defaults version to '', which left clients without version
-    information; the server now resolves it from package metadata with an
-    explicit "unknown" fallback — either way it must be non-empty.
+    information; the server resolves it from package metadata with an
+    explicit "unknown" fallback. Tightened for F6: the serverInfo version
+    must be exactly what ``_server_version()`` resolves (the old assertion
+    only checked membership in a two-value set — nearly tautological), and
+    it must never be empty.
     """
-    assert server_module.mcp.version
-    assert server_module._server_version() in ("unknown", server_module.mcp.version)
+    assert server_module.mcp.version != ""
+    assert server_module.mcp.version == server_module._server_version()
 
 
 def test_server_version_falls_back_when_metadata_missing(monkeypatch) -> None:

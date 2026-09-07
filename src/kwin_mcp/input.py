@@ -425,19 +425,20 @@ class EISClient:
         """Release the whole EIS connection and reset all bookkeeping.
 
         Safe to call on a partially initialized state: every step tolerates
-        zeroed slots. Used by the handshake failure path so a failed setup
-        cannot leak devices, the EI context or a live D-Bus cookie.
+        zeroed slots and suppresses the recoverable failures (dead D-Bus on
+        disconnect, dead socket on the touch cleanup touch_up), so a cleanup
+        failure can never abort the teardown halfway and leak devices, the
+        EI context or a live D-Bus cookie. Used by the handshake failure
+        path and by ``_reconnect`` (F3: the rebuild must be as defensive as
+        the handshake teardown, not a less-guarded duplicate of it).
         """
         with contextlib.suppress(dbus.DBusException):
             if self._eis_iface and self._cookie:
                 self._eis_iface.disconnect(dbus.Int32(self._cookie))
-                self._cookie = 0
-        for touch in self._active_touches.values():
-            with contextlib.suppress(RuntimeError):
-                _get_libei().ei_touch_up(touch)
-            _get_libei().ei_touch_unref(touch)
-        self._active_touches.clear()
-        self._next_touch_id = 0
+        # The cookie is dropped even if disconnect() raised (F3): a stale
+        # cookie must not leak into the fresh handshake after a rebuild.
+        self._cookie = 0
+        self._invalidate_touches()
         for attr in ("_touch_device", "_text_device", "_pointer", "_keyboard"):
             existing = getattr(self, attr)
             if existing:
@@ -452,6 +453,26 @@ class EISClient:
             _get_libei().ei_unref(self._ei)
             self._ei = 0
         self._connection_dead = False
+
+    def _invalidate_touches(self) -> None:
+        """Finish and release every active touch gesture, reset the IDs.
+
+        Shared by every path that drops touch state (F4): the reconnect
+        teardown, device PAUSED/REMOVED and seat removal. libei's API
+        contract is that pausing or removing a device releases all logically
+        down touches, and the reconnect unrefs the whole EI context — in all
+        three cases the stored touch pointers must not survive.
+
+        Per-touch failures are suppressed: a dead connection must not abort
+        the cleanup before the touches are unref'd and dropped (leaking them
+        would leave dangling pointers into a released EI context, A3).
+        """
+        for touch in self._active_touches.values():
+            with contextlib.suppress(RuntimeError):
+                _get_libei().ei_touch_up(touch)
+            _get_libei().ei_touch_unref(touch)
+        self._active_touches.clear()
+        self._next_touch_id = 0
 
     def _negotiate_devices(self, timeout: float = 5.0) -> None:
         """Process EIS handshake events until pointer + keyboard are emulating.
@@ -559,8 +580,14 @@ class EISClient:
             self._pause_device(event)
 
     def _handle_seat_removed(self) -> None:
-        """The seat went away: every device on it is gone (unref + forget)."""
+        """The seat went away: every device on it is gone (unref + forget).
+
+        All logically-down touches die with the seat and are released via
+        ``_invalidate_touches`` (F4): their stored pointers must not survive
+        the state reset.
+        """
         _ei_debug("seat removed; dropping all devices")
+        self._invalidate_touches()
         for attr in ("_pointer", "_keyboard", "_touch_device", "_text_device"):
             device = getattr(self, attr)
             if device:
@@ -584,11 +611,21 @@ class EISClient:
             self._emulating_devices.add(device)
 
     def _pause_device(self, event: int) -> None:
-        """Device paused by the server; stop sending events to it."""
+        """Device paused by the server; stop sending events to it.
+
+        Per the libei API, pausing a device resets its logical state to
+        neutral — any touches logically down on it are released. When the
+        paused device is the touch device, the active gestures are therefore
+        finished and dropped here (F4): keeping them in ``_active_touches``
+        would let a later touch_move/touch_up drive touches the server has
+        already discarded.
+        """
         device = _get_libei().ei_event_get_device(event)
         if device in self._emulating_devices:
             _get_libei().ei_device_stop_emulating(device)
             self._emulating_devices.discard(device)
+        if device != 0 and device == self._touch_device:
+            self._invalidate_touches()
 
     def _device_emulating(self, device: int) -> bool:
         """Whether the given device is registered and in emulating state."""
@@ -670,14 +707,24 @@ class EISClient:
         setattr(self, attr, _get_libei().ei_device_ref(device))
 
     def _remove_device(self, event: int) -> None:
-        """Drop a device that the server removed (unref + forget emulation)."""
+        """Drop a device that the server removed (unref + forget).
+
+        Removing a device releases its logically-down touches (libei resets
+        the device state), so dropping the touch device also invalidates the
+        active gestures (F4).
+        """
         device = _get_libei().ei_event_get_device(event)
         _ei_debug(f"device removed: {device}")
+        # Whether the removed device occupies the touch slot, checked BEFORE
+        # the loop clears the slots (comparing after would always see 0).
+        was_touch_device = device != 0 and device == self._touch_device
         for attr in ("_pointer", "_keyboard", "_touch_device", "_text_device"):
             if getattr(self, attr) == device:
                 setattr(self, attr, 0)
                 self._emulating_devices.discard(device)
                 _get_libei().ei_device_unref(device)
+        if was_touch_device:
+            self._invalidate_touches()
 
     def _now_us(self) -> int:
         """Current time in microseconds."""
@@ -717,10 +764,16 @@ class EISClient:
         unprocessed until the deadline expires. A dead connection (DISCONNECT
         event or failed dispatch) makes the wait fail immediately so the
         caller takes the reconnect path.
+
+        A NULL (0) EI context fails the wait immediately too (F1): a failed
+        reconnect leaves ``_ei == 0``, and probing libei with it
+        (``ei_get_fd(0)``) is a hard crash — libei 1.6.0 segfaults on
+        ei_get_fd(NULL)/ei_dispatch(NULL), which would kill the whole MCP
+        server instead of raising one clean ToolError.
         """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if self._connection_dead:
+            if self._connection_dead or self._ei == 0:
                 return False
             if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
                 return True
@@ -746,33 +799,21 @@ class EISClient:
         without resuming them; a fresh connectToEIS restores the session
         (adopted from 01SW/kwin-mcp).
 
-        The old EI context is unreferenced here, so all libei objects
-        belonging to it (device handles, active touch sequences) are stale
-        afterwards: touches are finished and dropped, devices and the
-        context are unref'd, bookkeeping is reset.
+        F3: the rebuild is ``_teardown_connection()`` + ``_setup()`` — the
+        same fully-defensive cleanup the handshake failure path uses, not a
+        hand-rolled duplicate. Previously the inline copy skipped
+        ``ei_device_stop_emulating`` before unref, suppressed neither the
+        touch-cleanup ``ei_touch_up`` nor the D-Bus ``disconnect`` failure,
+        and left a stale cookie; any of those could abort the rebuild
+        halfway, leaving the client dirty so the next injection repeated the
+        same failure.
+
+        The old EI context is unref'd here, so all libei objects belonging
+        to it (device handles, active touch sequences) are stale afterwards:
+        touches are finished and dropped, devices and the context are
+        unref'd, bookkeeping is reset.
         """
-        with contextlib.suppress(dbus.DBusException):
-            if self._eis_iface and self._cookie:
-                self._eis_iface.disconnect(dbus.Int32(self._cookie))
-        # Active touches hold pointers into the old EI context — they must be
-        # finished before the context is unref'd, or touch_motion/touch_up on
-        # a stale touch would use freed memory (use-after-free, A3).
-        for touch in self._active_touches.values():
-            _get_libei().ei_touch_up(touch)
-            _get_libei().ei_touch_unref(touch)
-        self._active_touches.clear()
-        self._next_touch_id = 0
-        for attr in ("_touch_device", "_text_device", "_pointer", "_keyboard"):
-            existing = getattr(self, attr)
-            if existing:
-                _get_libei().ei_device_unref(existing)
-                setattr(self, attr, 0)
-        self._emulating_devices.clear()
-        self._sequence = 0
-        if self._ei:
-            _get_libei().ei_unref(self._ei)
-            self._ei = 0
-        self._connection_dead = False
+        self._teardown_connection()
         self._setup()
 
     def _flush(self) -> None:
@@ -784,7 +825,14 @@ class EISClient:
         DISCONNECT event) marks the connection dead instead of being
         ignored — the next injection's readiness check then rebuilds the
         connection instead of sending into a void forever (B3).
+
+        A NULL (0) EI context marks the connection dead without touching
+        libei (F1): ``ei_dispatch(0)`` segfaults, and no dispatch is ever
+        meaningful on a torn-down connection.
         """
+        if self._ei == 0:
+            self._connection_dead = True
+            return
         if _get_libei().ei_dispatch(self._ei) < 0:
             self._connection_dead = True
             return
@@ -896,24 +944,44 @@ class EISClient:
         return touch_id
 
     def touch_move(self, touch_id: int, x: float, y: float) -> None:
-        """Move an active touch to (x, y)."""
+        """Move an active touch to (x, y).
+
+        The readiness check runs BEFORE the touch pointer is fetched (F2,
+        formerly W2): ``_ensure_devices_ready`` may rebuild the connection,
+        and a rebuild finishes and drops all active gestures — a pointer
+        captured before it would be dangling into the unref'd EI context
+        (use-after-free). Fetching after it means the touch is either still
+        alive (context unchanged, dict untouched) or gone (reconnect or a
+        server-side PAUSED/REMOVED invalidated it): a dead gesture raises
+        ValueError here, never touches freed memory. A reconnect ends every
+        active gesture; a gesture cannot be continued across one — start a
+        new touch instead.
+        """
+        self._ensure_devices_ready()
         touch = self._active_touches.get(touch_id)
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
             raise ValueError(msg)
-        self._ensure_devices_ready()
         device = self._touch_device or self._pointer
         _get_libei().ei_touch_motion(touch, x, y)
         _get_libei().ei_device_frame(device, self._now_us())
         self._flush()
 
     def touch_up(self, touch_id: int) -> None:
-        """End an active touch."""
+        """End an active touch.
+
+        Same ensure-first ordering as ``touch_move`` (F2, formerly W2): the
+        ID is resolved to a pointer only after the readiness check, and the
+        dict entry is popped only afterwards — the reconnect inside
+        ``_ensure_devices_ready`` cleans up the gestures itself, so popping
+        first would both skip that cleanup and leave the method holding a
+        dangling pointer for its own ``ei_touch_up``.
+        """
+        self._ensure_devices_ready()
         touch = self._active_touches.pop(touch_id, None)
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
             raise ValueError(msg)
-        self._ensure_devices_ready()
         device = self._touch_device or self._pointer
         _get_libei().ei_touch_up(touch)
         _get_libei().ei_device_frame(device, self._now_us())

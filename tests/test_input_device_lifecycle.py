@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import dbus
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -30,6 +31,7 @@ import kwin_mcp.input as input_module
 from kwin_mcp.input import (
     _EI_CAP_KEYBOARD,
     _EI_CAP_POINTER_ABSOLUTE,
+    _EI_CAP_TOUCH,
     _EI_EVENT_DEVICE_ADDED,
     _EI_EVENT_DEVICE_PAUSED,
     _EI_EVENT_DEVICE_REMOVED,
@@ -43,6 +45,7 @@ from kwin_mcp.input import (
 
 POINTER = 0x101
 KEYBOARD = 0x102
+TOUCH = 0x103
 NEW_POINTER = 0x201
 NEW_KEYBOARD = 0x202
 COOKIE = 7
@@ -75,9 +78,15 @@ class FakeLibei:
         self.touch_ups: list[int] = []
 
     def ei_get_fd(self, ei: int) -> int:
+        # Guard for F1: after a failed reconnect the client must never probe
+        # libei with a NULL (0) EI context — the real libei 1.6.0 segfaults
+        # (exit 139) on ei_get_fd(NULL)/ei_dispatch(NULL), killing the whole
+        # MCP server.
+        assert ei != 0, "ei_get_fd called with NULL EI context (segfault guard)"
         return 9
 
     def ei_dispatch(self, ei: int) -> int:
+        assert ei != 0, "ei_dispatch called with NULL EI context (segfault guard)"
         return self.dispatch_result
 
     def ei_get_event(self, ei: int) -> int:
@@ -248,11 +257,18 @@ def _install(monkeypatch, fake: FakeLibei) -> None:
 
 
 def _reconnecting_setup(client: EISClient, emulating: bool):
-    """Build a _setup stub simulating a fresh handshake after _reconnect."""
+    """Build a _setup stub simulating a fresh handshake after _reconnect.
+
+    Mirrors the real ``_setup`` contract: a fresh, non-zero EI context is
+    installed (101 = the fresh-context id SwitchingLibei hands out), so
+    injections after a successful reconnect never run against a NULL context
+    (the FakeLibei segfault guard asserts exactly that).
+    """
     calls: list[int] = []
 
     def fake_setup() -> None:
         calls.append(1)
+        client._ei = 101
         client._pointer = NEW_POINTER
         client._keyboard = NEW_KEYBOARD
         client._touch_device = 0
@@ -734,3 +750,290 @@ def test_client_state_fields_exist(monkeypatch) -> None:
     assert client._device_emulating(POINTER) is True
     assert client._device_emulating(0) is False
     assert client._device_emulating(0x999) is False
+
+
+# ── F1: a failed reconnect must leave a NULL EI context unusable ──────────
+
+
+def test_second_ensure_after_failed_reconnect_is_clean_tool_error(monkeypatch) -> None:
+    """After a failed reconnect the NEXT readiness check takes the reconnect
+    path again — never ei_get_fd(0)/ei_dispatch(0).
+
+    Regression for F1: a failed reconnect used to leave ``_ei == 0`` with
+    ``_connection_dead == False``. The next ``_ensure_devices_ready`` then
+    fell through to ``ei_get_fd(0)`` and libei 1.6.0 segfaulted (verified
+    empirically: exit 139), killing the whole MCP server. The FakeLibei
+    segfault guard (assert ei != 0 in ei_get_fd/ei_dispatch) stands in for
+    the real crash: one clean ToolError per call, no NULL-context probe.
+    """
+    stale = FakeLibei(
+        [],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    fresh = FakeLibei(
+        [
+            (_EI_EVENT_DEVICE_ADDED, NEW_POINTER),
+            (_EI_EVENT_DEVICE_ADDED, NEW_KEYBOARD),
+            (_EI_EVENT_DEVICE_RESUMED, NEW_POINTER),
+        ],
+        {NEW_POINTER: {_EI_CAP_POINTER_ABSOLUTE}, NEW_KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    router = SwitchingLibei([stale, fresh])
+    monkeypatch.setattr(input_module, "_get_libei", lambda: router)
+    monkeypatch.setattr(input_module.select, "select", lambda *a, **k: ([], [], []))
+    monkeypatch.setattr(input_module.dbus, "Interface", lambda *a, **k: FakeRemoteDesktopIface())
+    # Small step so the readiness-wait loop actually RUNS (a step larger than
+    # the timeout would skip the loop and with it the NULL-context guard).
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.01))
+
+    client = _client(stale)
+    client._emulating_devices = set()
+    client._bus = FakeBus()
+
+    with pytest.raises(ToolError, match="EIS reconnect failed"):
+        client._ensure_devices_ready(timeout_s=0.05)
+    # The failed handshake left the EI context NULL — this is the state that
+    # used to segfault on the next injection.
+    assert client._ei == 0
+    assert client._pointer == 0
+
+    # The next call must be one clean ToolError again (no crash, no infinite
+    # retry loop): the NULL context fails the wait instantly and the
+    # reconnect runs once more.
+    with pytest.raises(ToolError, match="EIS reconnect failed"):
+        client._ensure_devices_ready(timeout_s=0.05)
+    assert client._ei == 0
+    # Exactly one reconnect attempt per ensure call (fresh handshake twice).
+    assert fresh.setup_fds == [11, 11]
+
+
+# ── F2: touch gesture calls must fetch the touch pointer AFTER the
+#    readiness check, or a reconnect inside it turns the pointer dangling ──
+
+
+def _touch_client(fake: FakeLibei, touch_id: int = 0, pointer: int = 0x777) -> EISClient:
+    """A stalled client holding one active touch gesture."""
+    client = _client(fake)
+    client._emulating_devices = set()  # paused without resume → stall
+    client._active_touches = {touch_id: pointer}
+    client._next_touch_id = touch_id + 1
+    return client
+
+
+def test_touch_move_after_reconnect_rejects_stale_id(monkeypatch) -> None:
+    """Stall → touch_move(id) → ValueError, no ei_touch_motion on the dead
+    pointer.
+
+    Regression for F2/W2: touch_move fetched the touch pointer BEFORE
+    ``_ensure_devices_ready``; the reconnect inside it finished and dropped
+    all active touches, so the captured pointer dangled and
+    ``ei_touch_motion`` wrote into freed memory (use-after-free).
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _touch_client(fake)
+    client._setup, _setup_calls = _reconnecting_setup(client, emulating=True)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+
+    with pytest.raises(ValueError, match="No active touch"):
+        client.touch_move(0, 1.0, 2.0)
+
+    # The reconnect finished the gesture (touch_up + unref in the teardown);
+    # the gesture method itself never touched the stale pointer.
+    assert fake.touch_motions == []
+    assert fake.touch_ups == [0x777]
+    assert fake.unrefed_touches == [0x777]
+    assert client._active_touches == {}
+
+
+def test_touch_up_after_reconnect_rejects_stale_id(monkeypatch) -> None:
+    """Stall → touch_up(id) → ValueError, no second touch_up/unref of the
+    dead pointer.
+
+    Regression for F2/W2: touch_up popped the touch BEFORE
+    ``_ensure_devices_ready``, so the reconnect's teardown saw an empty dict
+    (no cleanup touch_up/unref) and the method then sent ``ei_touch_up`` into
+    freed memory — a use-after-free with a double-unref on top.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _touch_client(fake)
+    client._setup, _setup_calls = _reconnecting_setup(client, emulating=True)
+    monkeypatch.setattr(input_module, "time", FakeClock(step=0.5))
+
+    with pytest.raises(ValueError, match="No active touch"):
+        client.touch_up(0)
+
+    # Exactly one finish+release — the reconnect's cleanup, not the gesture
+    # method operating on the dangling pointer.
+    assert fake.touch_ups == [0x777]
+    assert fake.unrefed_touches == [0x777]
+    assert client._active_touches == {}
+
+
+def test_touch_move_with_successful_recovery_uses_live_pointer(monkeypatch) -> None:
+    """A gesture ID stays valid when the readiness check recovers without a
+    reconnect: the dict entry was never invalidated."""
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_RESUMED, POINTER), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    _install(monkeypatch, fake)
+    client = _touch_client(fake)
+
+    client.touch_move(0, 1.0, 2.0)
+
+    assert fake.touch_motions == [(0x777, 1.0, 2.0)]
+    assert client._active_touches == {0: 0x777}  # gesture continues
+
+
+# ── F3: _reconnect must reuse _teardown_connection (full, resilient) ──────
+
+
+class _DisconnectRaisesIface:
+    """D-Bus EIS interface stub whose disconnect() raises (dead bus)."""
+
+    def disconnect(self, cookie: int) -> None:
+        raise dbus.DBusException(f"bus gone (cookie {cookie})")
+
+
+def test_reconnect_survives_failing_touch_up_and_disconnect(monkeypatch) -> None:
+    """_reconnect completes the rebuild even when ei_touch_up and the D-Bus
+    disconnect both raise.
+
+    Regression for F3: the hand-rolled cleanup in _reconnect (a less
+    defensive duplicate of _teardown_connection) called ei_touch_up without
+    suppression, never stopped emulating devices before unref and never
+    reset the D-Bus cookie. Any failure there aborted the rebuild halfway;
+    _ensure_devices_ready caught the RuntimeError but the client stayed
+    dirty and the next injection repeated the same failure.
+    """
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+
+    def failing_touch_up(touch: int) -> None:
+        raise RuntimeError("EIS connection dead")
+
+    fake.ei_touch_up = failing_touch_up  # type: ignore[method-assign]
+    client = _client(fake)
+    client._active_touches = {0: 0x777}
+    client._sequence = 3
+    client._eis_iface = _DisconnectRaisesIface()
+    client._cookie = COOKIE
+    client._setup, setup_calls = _reconnecting_setup(client, emulating=False)
+
+    client._reconnect()
+
+    # The rebuild ran to completion despite both failures.
+    assert setup_calls == [1]
+    # Touches: the failing touch_up was suppressed, the touch still unref'd.
+    assert fake.touch_ups == []
+    assert fake.unrefed_touches == [0x777]
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
+    # Devices: stopped before release, then unref'd.
+    assert sorted(fake.stopped) == sorted([POINTER, KEYBOARD])
+    assert sorted(fake.unrefed_devices) == sorted([POINTER, KEYBOARD])
+    assert fake.unrefed_ei == [1]
+    # The cookie is dropped even though disconnect() raised.
+    assert client._cookie == 0
+
+
+# ── F4: server-driven device invalidation must release active touches ────
+
+
+def test_pause_on_touch_device_invalidates_active_touches(monkeypatch) -> None:
+    """PAUSED(touch device) finishes every active touch and resets the IDs.
+
+    Regression for F4: per the libei API docs, pausing a device resets its
+    logical state to neutral — "any touches logically down are released".
+    The client kept the gestures in ``_active_touches`` though the server
+    had already dropped them.
+    """
+    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, TOUCH)], {TOUCH: {_EI_CAP_TOUCH}})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888, 1: 0x889}
+    client._next_touch_id = 2
+
+    client._flush()
+
+    assert fake.stopped == [TOUCH]
+    assert fake.touch_ups == [0x888, 0x889]
+    assert fake.unrefed_touches == [0x888, 0x889]
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
+
+
+def test_pause_on_pointer_keeps_active_touches(monkeypatch) -> None:
+    """PAUSED(pointer) must not finish touches of the touch device."""
+    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+
+    client._flush()
+
+    assert fake.stopped == [POINTER]
+    assert client._active_touches == {0: 0x888}
+    assert fake.touch_ups == []
+
+
+def test_removed_touch_device_invalidates_active_touches(monkeypatch) -> None:
+    """REMOVED(touch device) releases its logically-down touches too."""
+    fake = FakeLibei([(_EI_EVENT_DEVICE_REMOVED, TOUCH)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {3: 0x888}
+    client._next_touch_id = 4
+
+    client._flush()
+
+    assert client._touch_device == 0
+    assert TOUCH in fake.unrefed_devices
+    assert fake.touch_ups == [0x888]
+    assert fake.unrefed_touches == [0x888]
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0
+
+
+def test_removed_pointer_device_keeps_touches(monkeypatch) -> None:
+    """REMOVED(pointer) leaves the touch device's gestures alone."""
+    fake = FakeLibei([(_EI_EVENT_DEVICE_REMOVED, POINTER)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+
+    client._flush()
+
+    assert client._pointer == 0
+    assert client._active_touches == {0: 0x888}
+    assert fake.touch_ups == []
+
+
+def test_seat_removed_invalidates_active_touches(monkeypatch) -> None:
+    """SEAT_REMOVED drops every device AND every logically-down touch."""
+    fake = FakeLibei([(_EI_EVENT_SEAT_REMOVED, 0)], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._touch_device = TOUCH
+    client._emulating_devices = {POINTER, KEYBOARD, TOUCH}
+    client._active_touches = {0: 0x888}
+    client._next_touch_id = 1
+
+    client._flush()
+
+    assert client._pointer == 0
+    assert client._touch_device == 0
+    assert fake.touch_ups == [0x888]
+    assert fake.unrefed_touches == [0x888]
+    assert client._active_touches == {}
+    assert client._next_touch_id == 0

@@ -388,7 +388,14 @@ class AutomationEngine:
         time.sleep(0.5)
         try:
             self._input = InputBackend(info.dbus_address)
-        except RuntimeError as exc:
+        except (RuntimeError, ToolError) as exc:
+            # ToolError, not just RuntimeError (F5): a partial EIS handshake
+            # (device never resumed) surfaces as ToolError from
+            # _negotiate_devices, and ToolError does not inherit RuntimeError
+            # — catching only RuntimeError killed session_start after the
+            # session was already up, breaking the degrade-to-no-input
+            # contract (screenshot/accessibility tools still work without
+            # input).
             logger.warning(
                 "KWin EIS input backend unavailable, degrading to no input backend: %s", exc
             )
@@ -451,7 +458,11 @@ class AutomationEngine:
         try:
             self._input = InputBackend(dbus_addr)
             result += "\nInput backend: KWin EIS"
-        except RuntimeError as exc:
+        except (RuntimeError, ToolError) as exc:
+            # ToolError, not just RuntimeError (F5): a partial EIS handshake
+            # raises ToolError from _negotiate_devices; without it in the
+            # tuple the failure escaped session_connect instead of degrading
+            # to the ydotool/no-input fallback.
             logger.warning(
                 "KWin EIS input backend unavailable, falling back to ydotool if present: %s", exc
             )

@@ -23,11 +23,16 @@ Adopted from upstream isac322/kwin-mcp PR #50:
 from __future__ import annotations
 
 import io
+import logging
 import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
+import kwin_mcp.core as core_module
 import kwin_mcp.session as session_module
+from kwin_mcp.core import AutomationEngine
+from kwin_mcp.errors import ToolError
 from kwin_mcp.session import Session, SessionConfig, SessionInfo
 
 
@@ -167,3 +172,89 @@ def test_launch_app_strips_host_display(monkeypatch, tmp_path) -> None:
     assert "DISPLAY" not in env
     assert env["WAYLAND_DISPLAY"] == "wayland-mcp-test"
     assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/tmp/dbus"
+
+
+def test_session_start_degrades_when_input_backend_raises_tool_error(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """InputBackend raising ToolError degrades to no input backend.
+
+    Regression for F5: a partial EIS handshake raises ToolError from
+    ``_negotiate_devices`` (tool_error). ``session_start`` only caught
+    RuntimeError, and ToolError does not inherit RuntimeError, so the
+    degradation contract of the tool result ("Input backend: ..." status
+    line) was violated by a hard crash of session_start after the session
+    was already up. Screenshot and accessibility tools still work without
+    input; losing them over a broken handshake is wrong.
+    """
+    info = SessionInfo(
+        dbus_address="unix:path=/tmp/dbus",
+        wayland_socket="wayland-mcp-test",
+        kwin_pid=1,
+        screenshot_dir=tmp_path,
+    )
+    monkeypatch.setattr(session_module.Session, "start", lambda self, config: info)
+
+    class _DegradingInput:
+        """InputBackend stand-in that raises ToolError in the constructor."""
+
+        def __init__(self, _dbus_address: str) -> None:
+            raise ToolError("EIS input devices did not resume within 5s: keyboard")
+
+    engine = AutomationEngine()
+    monkeypatch.setattr(core_module, "InputBackend", _DegradingInput)
+    # Auto-detection must not shell out to a real kscreen-doctor.
+    monkeypatch.setattr(core_module, "_detect_physical_screen_size", lambda: (800, 600))
+    monkeypatch.setattr(core_module.time, "sleep", lambda *_: None)
+
+    with caplog.at_level(logging.WARNING, logger="kwin_mcp.core"):
+        result = engine.session_start()
+
+    assert engine._input is None  # degraded, not crashed
+    assert "No input backend available" in result
+    assert "Session started" in result
+    assert "KWin EIS input backend unavailable" in caplog.text
+
+
+def test_session_connect_degrades_when_input_backend_raises_tool_error(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    """The session_connect twin of the session_start ToolError degradation.
+
+    Same F5 contract at the second InputBackend construction site
+    (core.py session_connect): a partial EIS handshake raises ToolError,
+    which must degrade to the ydotool/no-input fallback instead of
+    escaping session_connect after the live session was already attached.
+    """
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/dbus")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-mcp-test")
+    monkeypatch.setattr(core_module.time, "sleep", lambda *_: None)
+
+    class FakeBus:
+        def get_object(self, *_args: Any, **_kwargs: Any) -> object:
+            return object()
+
+    fake_dbus = SimpleNamespace(
+        DBusException=type("DBusException", (Exception,), {}),
+        bus=SimpleNamespace(BusConnection=lambda _addr: FakeBus()),
+    )
+    monkeypatch.setitem(sys.modules, "dbus", fake_dbus)
+    monkeypatch.setitem(sys.modules, "dbus.bus", fake_dbus.bus)
+
+    class _DegradingInput:
+        """InputBackend stand-in that raises ToolError in the constructor."""
+
+        def __init__(self, _dbus_address: str) -> None:
+            raise ToolError("EIS input devices did not resume within 5s: keyboard")
+
+    engine = AutomationEngine()
+    monkeypatch.setattr(core_module, "InputBackend", _DegradingInput)
+    monkeypatch.setattr(core_module.shutil, "which", lambda _name: None)
+
+    with caplog.at_level(logging.WARNING, logger="kwin_mcp.core"):
+        result = engine.session_connect()
+
+    assert engine._input is None  # degraded, not crashed
+    assert "Connected to live KWin session" in result
+    assert "No input backend available" in result
+    assert "KWin EIS input backend unavailable" in caplog.text
