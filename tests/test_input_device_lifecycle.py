@@ -36,7 +36,6 @@ from kwin_mcp.input import (
     _EI_CAP_TEXT,
     _EI_CAP_TOUCH,
     _EI_EVENT_DEVICE_ADDED,
-    _EI_EVENT_DEVICE_PAUSED,
     _EI_EVENT_DEVICE_REMOVED,
     _EI_EVENT_DEVICE_RESUMED,
     _EI_EVENT_DISCONNECT,
@@ -55,6 +54,11 @@ TEXT_DEV = 0x104  # stale-connection text device (paused)
 NEW_TEXT_DEV = 0x204  # fresh-connection text device
 NEW_TOUCH_DEV = 0x205  # fresh-connection touch device
 COOKIE = 7
+
+# Literal event-type int (issue #24): tests must not feed the module
+# constant back — a wrong constant would pass its own tests. The value is
+# pinned against libei.h by test_libei_constants.py.
+EI_PAUSED = 7
 
 
 class FakeLibei:
@@ -495,7 +499,7 @@ def test_ensure_devices_ready_reconnects_after_unresumed_pause(monkeypatch) -> N
     button into the already-paused device (silent drop; libei discards events
     from paused devices) and only recovered on the NEXT injection.
     """
-    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
+    fake = FakeLibei([(EI_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
     # Issue #235: the pre-reconnect stall wait is 0.5s now (was 5s), so the
     # clock step must stay below that budget for the wait loop to actually
@@ -685,7 +689,7 @@ def test_paused_after_send_is_not_tool_error(monkeypatch) -> None:
     connection is rebuilt, and the injection lands on the fresh devices —
     no ToolError, delivery succeeded.
     """
-    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
+    fake = FakeLibei([(EI_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
     # Issue #235: stall wait shortened to 0.5s — the clock step must stay
     # below it for the wait loop to run and drain the queued pause
@@ -742,7 +746,7 @@ def test_seat_removed_drops_all_devices(monkeypatch) -> None:
 
 def test_flush_processes_pause_event(monkeypatch) -> None:
     """A PAUSED event arriving after an injection is drained by _flush."""
-    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
+    fake = FakeLibei([(EI_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
     client = _client(fake)
 
@@ -1293,7 +1297,7 @@ def test_pause_on_touch_device_invalidates_active_touches(monkeypatch) -> None:
     The client kept the gestures in ``_active_touches`` though the server
     had already dropped them.
     """
-    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, TOUCH)], {TOUCH: {_EI_CAP_TOUCH}})
+    fake = FakeLibei([(EI_PAUSED, TOUCH)], {TOUCH: {_EI_CAP_TOUCH}})
     _install(monkeypatch, fake)
     client = _client(fake)
     client._touch_device = TOUCH
@@ -1312,7 +1316,7 @@ def test_pause_on_touch_device_invalidates_active_touches(monkeypatch) -> None:
 
 def test_pause_on_pointer_keeps_active_touches(monkeypatch) -> None:
     """PAUSED(pointer) must not finish touches of the touch device."""
-    fake = FakeLibei([(_EI_EVENT_DEVICE_PAUSED, POINTER)], {})
+    fake = FakeLibei([(EI_PAUSED, POINTER)], {})
     _install(monkeypatch, fake)
     client = _client(fake)
     client._touch_device = TOUCH
@@ -1426,7 +1430,7 @@ def test_wait_emulating_require_text_device_resumed(monkeypatch: Any) -> None:
 def test_drain_events_shared_helper(monkeypatch: Any) -> None:
     """_drain_events processes pause/resume transitions in one place."""
     fake = FakeLibei(
-        [(_EI_EVENT_DEVICE_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+        [(EI_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
         {POINTER: {_EI_CAP_POINTER_ABSOLUTE}},
     )
     _install(monkeypatch, fake)
@@ -1964,8 +1968,8 @@ def _pause_cycle_setup(
                     list(handshake),
                     dict(caps),
                     late_events=[
-                        (_EI_EVENT_DEVICE_PAUSED, NEW_POINTER),
-                        (_EI_EVENT_DEVICE_PAUSED, NEW_KEYBOARD),
+                        (EI_PAUSED, NEW_POINTER),
+                        (EI_PAUSED, NEW_KEYBOARD),
                     ],
                     late_caps={},
                     late_after_drains=1,
@@ -2248,7 +2252,7 @@ def test_hold_keys_replays_inside_same_call_post_send_drain(monkeypatch) -> None
     fake = DispatchInjectingLibei(
         [],
         {},
-        inject=[(_EI_EVENT_DEVICE_PAUSED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+        inject=[(EI_PAUSED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
     )
     _install(monkeypatch, fake)
     client = _client(fake)
@@ -2271,7 +2275,7 @@ def test_release_keys_not_replayed_inside_same_call_post_send_drain(monkeypatch)
     fake = DispatchInjectingLibei(
         [],
         {},
-        inject=[(_EI_EVENT_DEVICE_PAUSED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+        inject=[(EI_PAUSED, KEYBOARD), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
     )
     _install(monkeypatch, fake)
     client = _client(fake)
@@ -2288,7 +2292,7 @@ def test_hold_button_replays_inside_same_call_post_send_drain(monkeypatch) -> No
     fake = DispatchInjectingLibei(
         [],
         {},
-        inject=[(_EI_EVENT_DEVICE_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+        inject=[(EI_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
     )
     _install(monkeypatch, fake)
     client = _client(fake)
@@ -2304,7 +2308,7 @@ def test_release_button_not_replayed_inside_same_call_post_send_drain(monkeypatc
     fake = DispatchInjectingLibei(
         [],
         {},
-        inject=[(_EI_EVENT_DEVICE_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
+        inject=[(EI_PAUSED, POINTER), (_EI_EVENT_DEVICE_RESUMED, POINTER)],
     )
     _install(monkeypatch, fake)
     client = _client(fake)

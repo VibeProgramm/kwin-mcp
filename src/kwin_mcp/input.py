@@ -147,15 +147,20 @@ _EI_CAP_SCROLL = 1 << 4
 _EI_CAP_BUTTON = 1 << 5
 _EI_CAP_TEXT = 1 << 6  # libei >= 1.6: keysym/UTF-8 input resolved server-side
 
-# EI event types
+# EI event types (enum ei_event_type, libei.h 1.6.0; CONNECT is 1 and the
+# values increment in declaration order up to KEYBOARD_MODIFIERS = 9;
+# EI_EVENT_PONG is 90). Kept as literals — the module-level cross-check test
+# (test_libei_constants.py) parses the installed libei.h and would catch a
+# drift against the real header.
 _EI_EVENT_CONNECT = 1
 _EI_EVENT_DISCONNECT = 2
 _EI_EVENT_SEAT_ADDED = 3
 _EI_EVENT_SEAT_REMOVED = 4
 _EI_EVENT_DEVICE_ADDED = 5
 _EI_EVENT_DEVICE_REMOVED = 6
+_EI_EVENT_DEVICE_PAUSED = 7
 _EI_EVENT_DEVICE_RESUMED = 8
-_EI_EVENT_DEVICE_PAUSED = 9
+_EI_EVENT_KEYBOARD_MODIFIERS = 9
 
 # Scroll axis values (in libei, scroll is in pixels)
 _SCROLL_STEP_PIXELS = 15.0
@@ -713,6 +718,18 @@ class EISClient:
             self._resume_device(event)
         elif etype == _EI_EVENT_DEVICE_PAUSED:
             self._pause_device(event)
+        elif etype == _EI_EVENT_KEYBOARD_MODIFIERS:
+            # Server-side modifier-state change (libei 1.6, type 9): purely
+            # informational for a sender client. NOT a pause — previously the
+            # PAUSED constant was mispinned to 9, so these events parked
+            # healthy devices (stop_emulating + reconnects) while real
+            # pauses (7) fell through unhandled.
+            pass
+        else:
+            # Unknown event types (e.g. PONG/FRAME on newer libei): release
+            # happens in the drain; nothing to bookkeep. Logged for
+            # diagnosability under KWIN_MCP_DEBUG_EI=1.
+            _ei_debug(f"unhandled EIS event type {etype} (ignored)")
 
     def _handle_seat_removed(self) -> None:
         """The seat went away: every device on it is gone (unref + forget).

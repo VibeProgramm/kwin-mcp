@@ -35,7 +35,6 @@ from kwin_mcp.input import (
     _EI_CAP_POINTER_ABSOLUTE,
     _EI_CAP_TOUCH,
     _EI_EVENT_DEVICE_ADDED,
-    _EI_EVENT_DEVICE_PAUSED,
     _EI_EVENT_DEVICE_REMOVED,
     _EI_EVENT_DEVICE_RESUMED,
     _EI_EVENT_DISCONNECT,
@@ -45,6 +44,11 @@ from kwin_mcp.input import (
 )
 
 MULTI = 0x301  # one handle with several capabilities (several slots)
+
+# Literal event-type int (issue #24): tests must not feed the module
+# constant back — a wrong constant would pass its own tests. The value is
+# pinned against libei.h by test_libei_constants.py.
+EI_PAUSED = 7
 
 
 class CountingUnrefLibei(FakeLibei):
@@ -334,7 +338,7 @@ def test_pause_touch_device_still_sends_touch_up(monkeypatch: Any) -> None:
     dead instead.
     """
     fake = FakeLibei(
-        [(_EI_EVENT_DEVICE_PAUSED, TOUCH)],
+        [(EI_PAUSED, TOUCH)],
         {TOUCH: {_EI_CAP_TOUCH}},
     )
     _install(monkeypatch, fake)
@@ -359,7 +363,7 @@ def test_pause_touch_device_sends_no_touch_up_on_dead_connection(
     context.
     """
     fake = FakeLibei(
-        [(_EI_EVENT_DEVICE_PAUSED, TOUCH)],
+        [(EI_PAUSED, TOUCH)],
         {TOUCH: {_EI_CAP_TOUCH}},
     )
     _install(monkeypatch, fake)
