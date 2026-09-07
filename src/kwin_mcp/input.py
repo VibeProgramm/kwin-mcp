@@ -1076,20 +1076,13 @@ class InputBackend:
                 self._client.text_keysym(keysym, _RELEASED)
                 return
 
-        # Press modifiers
-        for mod in modifiers:
-            self._client.keyboard_key(mod, _PRESSED)
-            time.sleep(0.01)
-
-        # Press and release main key
-        self._client.keyboard_key(keycode, _PRESSED)
-        time.sleep(0.01)
-        self._client.keyboard_key(keycode, _RELEASED)
-
-        # Release modifiers in reverse order
-        for mod in reversed(modifiers):
-            time.sleep(0.01)
-            self._client.keyboard_key(mod, _RELEASED)
+        # Batch the press strokes into one frame: KWin pauses EIS devices
+        # mid-frame when a modifier combination spans multiple frames
+        # (adopted from 01SW/kwin-mcp).
+        self._client.keyboard_burst([(m, _PRESSED) for m in modifiers] + [(keycode, _PRESSED)])
+        time.sleep(0.02)
+        release_pairs = [(keycode, _RELEASED)] + [(m, _RELEASED) for m in reversed(modifiers)]
+        self._client.keyboard_burst(release_pairs)
 
     def keyboard_key(self, key: str) -> None:
         """Press a key combination (e.g., 'ctrl+c', 'Return', 'alt+F4').

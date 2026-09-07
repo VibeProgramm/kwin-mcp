@@ -33,6 +33,7 @@ from kwin_mcp.input import (
     _EI_EVENT_DEVICE_REMOVED,
     _EI_EVENT_DEVICE_RESUMED,
     _PRESSED,
+    _RELEASED,
     EISClient,
 )
 
@@ -340,6 +341,59 @@ def test_keyboard_key_waits_for_resume_before_sending(monkeypatch) -> None:
     assert fake.key_calls == [(30, _PRESSED)]
     assert [d for d, _ in fake.started] == sorted([POINTER, KEYBOARD])
     assert client._emulating_devices == {POINTER, KEYBOARD}
+
+
+def test_keyboard_burst_sends_single_frame(monkeypatch) -> None:
+    """All burst keys share one EIS frame (KWin unpause-safe combo shape)."""
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+
+    client.keyboard_burst([(29, _PRESSED), (45, _PRESSED)])
+
+    assert fake.key_calls == [(29, _PRESSED), (45, _PRESSED)]
+    assert fake.frames == [KEYBOARD]  # exactly one frame
+
+
+def test_keyboard_burst_waits_for_resume_before_sending(monkeypatch) -> None:
+    """A burst on paused devices drains the resume queue first."""
+    fake = FakeLibei(
+        [(_EI_EVENT_DEVICE_RESUMED, POINTER), (_EI_EVENT_DEVICE_RESUMED, KEYBOARD)],
+        {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}},
+    )
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    client._emulating_devices = set()
+
+    client.keyboard_burst([(29, _PRESSED), (42, _PRESSED), (45, _PRESSED)])
+
+    assert fake.key_calls == [(29, _PRESSED), (42, _PRESSED), (45, _PRESSED)]
+    assert fake.frames == [KEYBOARD]
+    assert client._emulating_devices == {POINTER, KEYBOARD}
+
+
+def test_press_key_combo_uses_burst_pairs(monkeypatch) -> None:
+    """A modifier combo is two bursts: press strokes, then release strokes."""
+    from kwin_mcp.input import InputBackend
+
+    fake = FakeLibei([], {})
+    _install(monkeypatch, fake)
+    client = _client(fake)
+    backend = InputBackend.__new__(InputBackend)
+    backend._client = client
+
+    # ctrl+x: ctrl(29), x(45) — press batched, pause, release batched.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(input_module.time, "sleep", lambda *_: None)
+        backend._press_key_combo("ctrl+x")
+
+    assert fake.key_calls == [
+        (29, _PRESSED),
+        (45, _PRESSED),
+        (45, _RELEASED),
+        (29, _RELEASED),
+    ]
+    assert fake.frames == [KEYBOARD, KEYBOARD]  # two frames: press burst, release burst
 
 
 def test_client_state_fields_exist(monkeypatch) -> None:

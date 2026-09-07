@@ -24,6 +24,8 @@ import pytest
 
 from kwin_mcp.input import (
     _ASCII_TO_KEYSYM,
+    _PRESSED,
+    _RELEASED,
     InputBackend,
     ascii_char_to_keysym,
     key_name_to_keysym,
@@ -146,9 +148,10 @@ def test_keyboard_key_combo_keeps_keycode_path() -> None:
     backend, client = _backend_with_text_device()
     backend.keyboard_key("ctrl+x")
     client.text_keysym.assert_not_called()
-    # ctrl (29) + x (45 = KEY_X) pressed and released via the keyboard device.
-    codes = [c.args[0] for c in client.keyboard_key.call_args_list]
-    assert codes == [29, 45, 45, 29]  # ctrl down, x down, x up, ctrl up
+    # Burst frame semantics (adopted from 01SW/kwin-mcp): the press strokes
+    # share one EIS frame, the release strokes another. ctrl (29), x (45).
+    bursts = [c.args[0] for c in client.keyboard_burst.call_args_list]
+    assert bursts == [[(29, _PRESSED), (45, _PRESSED)], [(45, _RELEASED), (29, _RELEASED)]]
 
 
 def test_keyboard_key_ctrl_q_sends_both_bindings() -> None:
@@ -156,14 +159,20 @@ def test_keyboard_key_ctrl_q_sends_both_bindings() -> None:
     kwrite, kcalc — but unbound in Konsole) and Ctrl+Shift+Q (Konsole's
     close-window binding, its ACCEL convention is Ctrl+Shift). Sending only
     one closed just whichever app bound it (N1); on apps that bind the other
-    combo it is an inert no-op shortcut."""
+    combo it is an inert no-op shortcut. The two combos stay in separate
+    frame pairs (four bursts), never merged into one frame."""
     backend, client = _backend_with_text_device()
     backend.keyboard_key("ctrl+q")
     client.text_keysym.assert_not_called()
-    codes = [c.args[0] for c in client.keyboard_key.call_args_list]
     # First combo: ctrl(29) q(16) down/up. Second combo: ctrl(29) shift(42)
     # q(16) down/up. No recursion, each combo sent exactly once.
-    assert codes == [29, 16, 16, 29, 29, 42, 16, 16, 42, 29]
+    bursts = [c.args[0] for c in client.keyboard_burst.call_args_list]
+    assert bursts == [
+        [(29, _PRESSED), (16, _PRESSED)],  # ctrl+q press
+        [(16, _RELEASED), (29, _RELEASED)],  # ctrl+q release
+        [(29, _PRESSED), (42, _PRESSED), (16, _PRESSED)],  # ctrl+shift+q press
+        [(16, _RELEASED), (42, _RELEASED), (29, _RELEASED)],  # ctrl+shift+q release
+    ]
 
 
 def test_keyboard_key_ctrl_q_alias_variants_send_both_bindings() -> None:
@@ -172,8 +181,13 @@ def test_keyboard_key_ctrl_q_alias_variants_send_both_bindings() -> None:
         backend, client = _backend_with_text_device()
         backend.keyboard_key(spelling)
         client.text_keysym.assert_not_called()
-        codes = [c.args[0] for c in client.keyboard_key.call_args_list]
-        assert codes == [29, 16, 16, 29, 29, 42, 16, 16, 42, 29]
+        bursts = [c.args[0] for c in client.keyboard_burst.call_args_list]
+        assert bursts == [
+            [(29, _PRESSED), (16, _PRESSED)],
+            [(16, _RELEASED), (29, _RELEASED)],
+            [(29, _PRESSED), (42, _PRESSED), (16, _PRESSED)],
+            [(16, _RELEASED), (42, _RELEASED), (29, _RELEASED)],
+        ]
 
 
 def test_keyboard_key_plain_ctrl_shift_q_is_not_duplicated() -> None:
@@ -181,8 +195,11 @@ def test_keyboard_key_plain_ctrl_shift_q_is_not_duplicated() -> None:
     the keycode path sends exactly one ctrl+shift+q combo."""
     backend, client = _backend_with_text_device()
     backend.keyboard_key("ctrl+shift+q")
-    codes = [c.args[0] for c in client.keyboard_key.call_args_list]
-    assert codes == [29, 42, 16, 16, 42, 29]
+    bursts = [c.args[0] for c in client.keyboard_burst.call_args_list]
+    assert bursts == [
+        [(29, _PRESSED), (42, _PRESSED), (16, _PRESSED)],
+        [(16, _RELEASED), (42, _RELEASED), (29, _RELEASED)],
+    ]
 
 
 def test_keyboard_key_unknown_key_is_noop() -> None:
@@ -191,6 +208,7 @@ def test_keyboard_key_unknown_key_is_noop() -> None:
     backend.keyboard_key("f13")  # not in any mapping table
     client.text_keysym.assert_not_called()
     client.keyboard_key.assert_not_called()
+    client.keyboard_burst.assert_not_called()
 
 
 def test_keyboard_type_unicode_chars_skipped_in_ascii_path() -> None:
