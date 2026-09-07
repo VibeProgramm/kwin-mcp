@@ -13,9 +13,11 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.util
+import os
 import select
 import shutil
 import subprocess
+import sys
 import time
 from enum import Enum
 
@@ -24,6 +26,14 @@ import dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 
 from kwin_mcp.errors import tool_error
+
+_DEBUG_EI = os.environ.get("KWIN_MCP_DEBUG_EI") == "1"
+
+
+def _ei_debug(msg: str) -> None:
+    """Print an EI debug line to stderr when KWIN_MCP_DEBUG_EI=1 is set."""
+    if _DEBUG_EI:
+        print(f"[EI] {msg}", file=sys.stderr, flush=True)
 
 
 class MouseButton(Enum):
@@ -128,8 +138,11 @@ _EI_CAP_TEXT = 1 << 6  # libei >= 1.6: keysym/UTF-8 input resolved server-side
 _EI_EVENT_CONNECT = 1
 _EI_EVENT_DISCONNECT = 2
 _EI_EVENT_SEAT_ADDED = 3
+_EI_EVENT_SEAT_REMOVED = 4
 _EI_EVENT_DEVICE_ADDED = 5
+_EI_EVENT_DEVICE_REMOVED = 6
 _EI_EVENT_DEVICE_RESUMED = 8
+_EI_EVENT_DEVICE_PAUSED = 9
 
 # Scroll axis values (in libei, scroll is in pixels)
 _SCROLL_STEP_PIXELS = 15.0
@@ -334,6 +347,8 @@ class EISClient:
         self._eis_iface: dbus.Interface | None = None
         self._next_touch_id: int = 0  # auto-increment touch ID
         self._active_touches: dict[int, int] = {}  # touch_id -> ctypes pointer
+        self._sequence: int = 0  # libei start-emulating sequence counter
+        self._emulating_devices: set[int] = set()  # devices currently in emulating state
         self._setup()
 
     def _setup(self) -> None:
@@ -381,20 +396,23 @@ class EISClient:
         self._negotiate_devices()
 
     def _negotiate_devices(self, timeout: float = 5.0) -> None:
-        """Process EIS handshake events until pointer + keyboard are usable.
+        """Process EIS handshake events until pointer + keyboard are emulating.
 
         A libei device may only send events once the server has resumed it.
         Calling ``ei_device_start_emulating()`` earlier is rejected ("device
         is not emulating") and every event sent afterwards is silently
         dropped, so wait for ``EI_EVENT_DEVICE_RESUMED`` on each of pointer
-        and keyboard before starting emulation (adapted from upstream
+        and keyboard before proceeding (adapted from upstream
         isac322/kwin-mcp#42). Unlike upstream, which falls back to an
         unconditional start for devices that never resumed, this fork raises:
         silent input loss is exactly what the wait exists to prevent.
+
+        Emulation starts inside the RESUMED handler (``_resume_device``) so
+        the same bookkeeping applies to devices that resume later (touch,
+        text) and to re-negotiations after a reconnect.
         """
         ei_fd = _get_libei().ei_get_fd(self._ei)
         start = time.monotonic()
-        resumed: set[int] = set()
 
         while time.monotonic() - start < timeout:
             readable, _, _ = select.select([ei_fd], [], [], 0.3)
@@ -407,31 +425,10 @@ class EISClient:
                 event = _get_libei().ei_get_event(self._ei)
                 if not event:
                     break
-
-                etype = _get_libei().ei_event_get_type(event)
-
-                if etype == _EI_EVENT_DISCONNECT:
-                    _get_libei().ei_event_unref(event)
-                    msg = "EIS server disconnected during handshake"
-                    raise RuntimeError(msg)
-
-                if etype == _EI_EVENT_SEAT_ADDED:
-                    self._bind_seat_capabilities(event)
-
-                elif etype == _EI_EVENT_DEVICE_ADDED:
-                    self._register_device(event)
-
-                elif etype == _EI_EVENT_DEVICE_RESUMED:
-                    resumed.add(int(_get_libei().ei_event_get_device(event)))
-
+                self._handle_event(event)
                 _get_libei().ei_event_unref(event)
 
-            if (
-                self._pointer
-                and self._pointer in resumed
-                and self._keyboard
-                and self._keyboard in resumed
-            ):
+            if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
                 break
 
         if not self._pointer:
@@ -444,7 +441,7 @@ class EISClient:
         missing = [
             name
             for device, name in ((self._pointer, "pointer"), (self._keyboard, "keyboard"))
-            if device not in resumed
+            if not self._device_emulating(device)
         ]
         if missing:
             tool_error(
@@ -453,18 +450,48 @@ class EISClient:
                 "non-resumed devices). Verify the KWin EIS RemoteDesktop interface."
             )
 
-        # Start emulating on all devices
-        _get_libei().ei_device_start_emulating(self._pointer, 0)
-        if self._keyboard != self._pointer:
-            _get_libei().ei_device_start_emulating(self._keyboard, 0)
-        if self._touch_device and self._touch_device not in (self._pointer, self._keyboard):
-            _get_libei().ei_device_start_emulating(self._touch_device, 0)
-        if self._text_device and self._text_device not in (
-            self._pointer,
-            self._keyboard,
-            self._touch_device,
-        ):
-            _get_libei().ei_device_start_emulating(self._text_device, 0)
+    def _handle_event(self, event: int) -> None:
+        """Handle one inbound EIS event affecting our input devices.
+
+        Central dispatcher shared by the handshake, ``_flush`` and the
+        device-readiness wait, so PAUSED/REMOVED/RESUMED transitions sent
+        mid-session (KWin pauses EIS devices around input bursts) update our
+        device bookkeeping wherever they arrive.
+        """
+        etype = _get_libei().ei_event_get_type(event)
+        _ei_debug(f"event type={etype}")
+        if etype == _EI_EVENT_DISCONNECT:
+            msg = "EIS server disconnected"
+            raise RuntimeError(msg)
+        if etype == _EI_EVENT_SEAT_ADDED:
+            self._bind_seat_capabilities(event)
+        elif etype == _EI_EVENT_DEVICE_ADDED:
+            self._register_device(event)
+        elif etype == _EI_EVENT_DEVICE_REMOVED:
+            self._remove_device(event)
+        elif etype == _EI_EVENT_DEVICE_RESUMED:
+            self._resume_device(event)
+        elif etype == _EI_EVENT_DEVICE_PAUSED:
+            self._pause_device(event)
+
+    def _resume_device(self, event: int) -> None:
+        """Device resumed by the server; request emulation so events flow."""
+        device = _get_libei().ei_event_get_device(event)
+        if device in (self._pointer, self._keyboard, self._touch_device, self._text_device):
+            self._sequence += 1
+            _get_libei().ei_device_start_emulating(device, self._sequence)
+            self._emulating_devices.add(device)
+
+    def _pause_device(self, event: int) -> None:
+        """Device paused by the server; stop sending events to it."""
+        device = _get_libei().ei_event_get_device(event)
+        if device in self._emulating_devices:
+            _get_libei().ei_device_stop_emulating(device)
+            self._emulating_devices.discard(device)
+
+    def _device_emulating(self, device: int) -> bool:
+        """Whether the given device is registered and in emulating state."""
+        return device != 0 and device in self._emulating_devices
 
     @property
     def has_text_device(self) -> bool:
@@ -496,7 +523,12 @@ class EISClient:
         func(seat, *args)
 
     def _register_device(self, event: int) -> None:
-        """Register a device from a DEVICE_ADDED event."""
+        """Register a device from a DEVICE_ADDED event.
+
+        KWin can remove and re-add its EIS devices between input bursts, so
+        a re-advertised device must always replace any stale reference
+        (adopted from 01SW/kwin-mcp).
+        """
         device = _get_libei().ei_event_get_device(event)
 
         has_abs = _get_libei().ei_device_has_capability(device, _EI_CAP_POINTER_ABSOLUTE)
@@ -505,56 +537,171 @@ class EISClient:
         has_text = _get_libei().ei_device_has_capability(device, _EI_CAP_TEXT)
 
         # Prefer absolute pointer device
-        if has_abs and not self._pointer:
-            self._pointer = _get_libei().ei_device_ref(device)
-        if has_kbd and not self._keyboard:
-            self._keyboard = _get_libei().ei_device_ref(device)
-        if has_touch and not self._touch_device:
-            self._touch_device = _get_libei().ei_device_ref(device)
-        if has_text and not self._text_device:
-            self._text_device = _get_libei().ei_device_ref(device)
+        if has_abs:
+            self._replace_device_ref("_pointer", device)
+        if has_kbd:
+            self._replace_device_ref("_keyboard", device)
+        if has_touch:
+            self._replace_device_ref("_touch_device", device)
+        if has_text:
+            self._replace_device_ref("_text_device", device)
+
+    def _replace_device_ref(self, attr: str, device: int) -> None:
+        """Switch a device-slot attribute to a newly advertised device."""
+        old = getattr(self, attr)
+        if old == device:
+            return
+        if old:
+            _get_libei().ei_device_unref(old)
+        setattr(self, attr, _get_libei().ei_device_ref(device))
+        self._emulating_devices.discard(old)
+
+    def _remove_device(self, event: int) -> None:
+        """Drop a device that the server removed (unref + forget emulation)."""
+        device = _get_libei().ei_event_get_device(event)
+        _ei_debug(f"device removed: {device}")
+        for attr in ("_pointer", "_keyboard", "_touch_device", "_text_device"):
+            if getattr(self, attr) == device:
+                setattr(self, attr, 0)
+                self._emulating_devices.discard(device)
+                _get_libei().ei_device_unref(device)
 
     def _now_us(self) -> int:
         """Current time in microseconds."""
         return int(time.monotonic() * 1_000_000)
 
+    def _ensure_devices_ready(self, timeout_s: float = 5.0) -> None:
+        """Wait until pointer + keyboard are emulating, processing events.
+
+        KWin can remove/re-add or pause its EIS devices around input bursts
+        (observed right after session start and after modifier presses).
+        Re-advertised devices are re-registered while draining the event
+        queue; if the connection is stalled (paused devices that never
+        resume), it is rebuilt so injection continues (adopted from
+        01SW/kwin-mcp).
+        """
+        if self._wait_emulating(timeout_s):
+            return
+        _ei_debug("devices stalled; reconnecting EIS")
+        self._reconnect()
+        if not self._wait_emulating(3.0):
+            msg = "EIS devices are not in emulating state"
+            raise RuntimeError(msg)
+
+    def _wait_emulating(self, timeout_s: float) -> bool:
+        """Wait until pointer + keyboard are emulating, draining events.
+
+        The queue is drained on every iteration (not only when the fd is
+        readable): events queued by a previous dispatch would otherwise sit
+        unprocessed until the deadline expires.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._device_emulating(self._pointer) and self._device_emulating(self._keyboard):
+                return True
+            ei_fd = _get_libei().ei_get_fd(self._ei)
+            readable, _, _ = select.select([ei_fd], [], [], 0.05)
+            if readable:
+                ret = _get_libei().ei_dispatch(self._ei)
+                if ret < 0:
+                    return False
+            while True:
+                event = _get_libei().ei_get_event(self._ei)
+                if not event:
+                    break
+                self._handle_event(event)
+                _get_libei().ei_event_unref(event)
+        return False
+
+    def _reconnect(self) -> None:
+        """Rebuild the EIS connection after the server stopped negotiating.
+
+        KWin pauses EIS devices (e.g. after the client presses a modifier)
+        without resuming them; a fresh connectToEIS restores the session
+        (adopted from 01SW/kwin-mcp).
+        """
+        with contextlib.suppress(dbus.DBusException):
+            if self._eis_iface and self._cookie:
+                self._eis_iface.disconnect(dbus.Int32(self._cookie))
+        for attr in ("_touch_device", "_text_device", "_pointer", "_keyboard"):
+            existing = getattr(self, attr)
+            if existing:
+                _get_libei().ei_device_unref(existing)
+                setattr(self, attr, 0)
+        self._emulating_devices.clear()
+        self._sequence = 0
+        if self._ei:
+            _get_libei().ei_unref(self._ei)
+            self._ei = 0
+        self._setup()
+
     def _flush(self) -> None:
-        """Dispatch pending events to send data to KWin."""
+        """Dispatch pending events to send data to KWin, then drain replies.
+
+        Draining processes device pause/resume/remove events so our
+        emulation bookkeeping stays in sync with the server between
+        injections.
+        """
         _get_libei().ei_dispatch(self._ei)
+        while True:
+            event = _get_libei().ei_get_event(self._ei)
+            if not event:
+                break
+            self._handle_event(event)
+            _get_libei().ei_event_unref(event)
 
     def pointer_move_absolute(self, x: float, y: float) -> None:
         """Move pointer to absolute coordinates."""
+        self._ensure_devices_ready()
         _get_libei().ei_device_pointer_motion_absolute(self._pointer, x, y)
         _get_libei().ei_device_frame(self._pointer, self._now_us())
         self._flush()
 
     def pointer_button(self, button: int, state: int) -> None:
         """Press/release a mouse button (evdev button code)."""
+        self._ensure_devices_ready()
         _get_libei().ei_device_button_button(self._pointer, button, state)
         _get_libei().ei_device_frame(self._pointer, self._now_us())
         self._flush()
 
     def pointer_scroll(self, dx: float, dy: float) -> None:
         """Scroll by pixel delta."""
+        self._ensure_devices_ready()
         _get_libei().ei_device_scroll_delta(self._pointer, dx, dy)
         _get_libei().ei_device_frame(self._pointer, self._now_us())
         self._flush()
 
     def pointer_scroll_discrete(self, dx: int, dy: int) -> None:
         """Scroll by discrete steps (wheel ticks)."""
+        self._ensure_devices_ready()
         _get_libei().ei_device_scroll_discrete(self._pointer, dx, dy)
         _get_libei().ei_device_frame(self._pointer, self._now_us())
         self._flush()
 
     def pointer_scroll_stop(self) -> None:
         """Signal end of scroll."""
+        self._ensure_devices_ready()
         _get_libei().ei_device_scroll_stop(self._pointer, 1, 1)
         _get_libei().ei_device_frame(self._pointer, self._now_us())
         self._flush()
 
     def keyboard_key(self, keycode: int, state: int) -> None:
         """Press/release a key (evdev keycode)."""
+        self._ensure_devices_ready()
         _get_libei().ei_device_keyboard_key(self._keyboard, keycode, state)
+        _get_libei().ei_device_frame(self._keyboard, self._now_us())
+        self._flush()
+
+    def keyboard_burst(self, pairs: list[tuple[int, int]]) -> None:
+        """Send several key events in a single frame.
+
+        KWin pauses its EIS devices mid-frame when a modifier combination
+        (e.g. alt+F4) spans multiple frames; batching the press strokes in
+        one frame keeps the combination intact (adopted from 01SW/kwin-mcp).
+        """
+        self._ensure_devices_ready()
+        for keycode, state in pairs:
+            _get_libei().ei_device_keyboard_key(self._keyboard, keycode, state)
         _get_libei().ei_device_frame(self._keyboard, self._now_us())
         self._flush()
 
@@ -568,6 +715,7 @@ class EISClient:
         if not self._text_device:
             msg = "No EIS text device available (libei >= 1.6 required)"
             raise RuntimeError(msg)
+        self._ensure_devices_ready()
         _get_libei().ei_device_text_keysym(self._text_device, keysym, state)
         _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
@@ -580,12 +728,14 @@ class EISClient:
         if not self._text_device:
             msg = "No EIS text device available (libei >= 1.6 required)"
             raise RuntimeError(msg)
+        self._ensure_devices_ready()
         _get_libei().ei_device_text_utf8(self._text_device, text.encode("utf-8"))
         _get_libei().ei_device_frame(self._text_device, self._now_us())
         self._flush()
 
     def touch_down(self, x: float, y: float) -> int:
         """Start a new touch at (x, y). Returns a touch ID."""
+        self._ensure_devices_ready()
         device = self._touch_device or self._pointer
         touch = _get_libei().ei_device_touch_new(device)
         if not touch:
@@ -606,6 +756,7 @@ class EISClient:
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
             raise ValueError(msg)
+        self._ensure_devices_ready()
         device = self._touch_device or self._pointer
         _get_libei().ei_touch_motion(touch, x, y)
         _get_libei().ei_device_frame(device, self._now_us())
@@ -617,6 +768,7 @@ class EISClient:
         if touch is None:
             msg = f"No active touch with ID {touch_id}"
             raise ValueError(msg)
+        self._ensure_devices_ready()
         device = self._touch_device or self._pointer
         _get_libei().ei_touch_up(touch)
         _get_libei().ei_device_frame(device, self._now_us())
@@ -630,6 +782,7 @@ class EISClient:
             _get_libei().ei_touch_up(touch)
             _get_libei().ei_touch_unref(touch)
         self._active_touches.clear()
+        self._emulating_devices.clear()
 
         if self._touch_device and self._touch_device not in (self._pointer, self._keyboard):
             _get_libei().ei_device_stop_emulating(self._touch_device)

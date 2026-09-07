@@ -87,6 +87,8 @@ def _client() -> EISClient:
     client._keyboard = 0
     client._touch_device = 0
     client._text_device = 0
+    client._sequence = 0
+    client._emulating_devices = set()
     return client
 
 
@@ -132,7 +134,9 @@ def test_negotiate_times_out_without_any_resumed(monkeypatch) -> None:
 
 def test_negotiate_times_out_when_keyboard_never_resumes(monkeypatch) -> None:
     """A partially resumed handshake is still a failure: injecting on the
-    keyboard alone would silently drop all typing."""
+    keyboard alone would silently drop all typing. The keyboard that never
+    received RESUMED is never started emulating (the pointer that did resume
+    may be started by the RESUMED handler before the handshake aborts)."""
     caps = {POINTER: {_EI_CAP_POINTER_ABSOLUTE}, KEYBOARD: {_EI_CAP_KEYBOARD}}
     events = [
         (_EI_EVENT_DEVICE_ADDED, POINTER),
@@ -145,4 +149,4 @@ def test_negotiate_times_out_when_keyboard_never_resumes(monkeypatch) -> None:
     client = _client()
     with pytest.raises(ToolError, match="resum"):
         client._negotiate_devices(timeout=0.1)
-    assert fake.started == []
+    assert KEYBOARD not in fake.started
