@@ -28,6 +28,14 @@ from kwin_mcp.session import LiveSession, Session, SessionConfig
 
 logger = logging.getLogger(__name__)
 
+# Frame file names produced by the burst capture (screenshot.py, both the
+# ScreenShot2 and the spectacle path): "frame_{i:03d}_{delay_ms}ms.png" —
+# the frame's position in the sorted delay list plus its TRUE capture
+# delay. Used by _with_frame_capture to label frames: the capture layer
+# skips empty frames inside its internals, so list position alone cannot
+# recover the delay.
+_FRAME_NAME_RE = re.compile(r"frame_\d{3}_(\d+)ms\.png$")
+
 _DEFAULT_VIRTUAL_SIZE = (1920, 1080)
 
 # kscreen-doctor colourises its output with SGR escape sequences even when
@@ -382,19 +390,21 @@ class AutomationEngine:
         )
 
         lines = [action_result, f"Captured {len(frames)} frames:"]
-        # Empty (failed) frames are dropped by the capture path on purpose
-        # (screenshot.py: "an empty frame is not an error here"), so pairing
-        # delays with frames must skip them the same way — pairing with
-        # strict zip would raise ValueError on a burst with a failed frame
-        # instead of reporting the frames that did land.
-        landed = [
-            (delay, path)
-            for delay, path in zip(sorted(screenshot_after_ms), frames, strict=False)
-            if path
-        ]
-        for delay_ms, path in landed:
+        # The capture layer (screenshot.py) skips empty (failed) frames
+        # inside its own internals — core.py never sees which delay was
+        # dropped — so pairing the requested delays against the returned
+        # paths positionally mislabels every frame after an interior
+        # empty one (delays [0, 100, 200] with an empty 100ms frame
+        # reported the 200ms file as "100ms"). The capture layer instead
+        # encodes the true per-frame delay in the file name
+        # (frame_{i:03d}_{delay_ms}ms.png), so the label is read from the
+        # name; anything off-convention degrades to an honest "?" rather
+        # than a plausible false timing.
+        for path in frames:
             size_kb = path.stat().st_size / 1024
-            lines.append(f"  {delay_ms}ms: {path} ({size_kb:.1f} KB)")
+            match = _FRAME_NAME_RE.search(path.name)
+            delay_label = f"{match.group(1)}ms" if match else "?ms"
+            lines.append(f"  {delay_label}: {path} ({size_kb:.1f} KB)")
         return "\n".join(lines)
 
     # ── Session management ────────────────────────────────────────────────
