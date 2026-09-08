@@ -93,12 +93,13 @@ def test_wtype_failure_falls_back_to_clipboard(monkeypatch) -> None:
 
 def test_no_tools_returns_false(monkeypatch) -> None:
     """Neither wtype nor wl-copy available → returns False, nothing spawned."""
+    run = MagicMock()
     monkeypatch.setattr(shutil, "which", lambda _name: None)
-    monkeypatch.setattr(subprocess, "run", MagicMock())
+    monkeypatch.setattr(subprocess, "run", run)
     monkeypatch.setattr(subprocess, "Popen", MagicMock())
 
     backend = InputBackend.__new__(InputBackend)
     ok = backend.keyboard_type_unicode("test", env=_SESSION_ENV)
 
     assert ok is False
-    subprocess.run.assert_not_called()  # type: ignore[attr-defined]
+    run.assert_not_called()

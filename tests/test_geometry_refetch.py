@@ -101,6 +101,8 @@ def _install_fake_dbus(monkeypatch: Any, conn: FakeConn, payload: str = _PAYLOAD
     to identity), so the fake script can deliver the payload through it.
     """
     import dbus
+    import dbus.bus
+    import dbus.mainloop.glib
     import dbus.service
     import gi
     import gi.repository

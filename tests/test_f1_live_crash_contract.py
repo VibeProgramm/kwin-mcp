@@ -51,7 +51,7 @@ class ExplodingLibei(FakeLibei):
         )
         self.new_calls = 0
 
-    def ei_new_sender(self, _a: int) -> int:
+    def ei_new_sender(self, _arg: int) -> int:
         self.new_calls += 1
         if self.new_calls > 1:
             msg = "simulated ei_new_sender failure"

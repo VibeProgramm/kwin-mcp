@@ -469,14 +469,16 @@ def test_ensure_devices_ready_reconnects_on_stall(monkeypatch) -> None:
     _install(monkeypatch, fake)
     client = _client(fake)
     client._emulating_devices = set()
-    client._eis_iface = FakeIface()
+    client._eis_iface = FakeIface()  # ty: ignore[invalid-assignment]
     client._cookie = COOKIE
     client._setup, setup_calls = _reconnecting_setup(client, emulating=True)
 
     client._ensure_devices_ready(timeout_s=0.05)
 
     assert setup_calls == [1]
-    assert client._eis_iface.disconnected == [COOKIE]
+    iface = client._eis_iface
+    assert iface is not None
+    assert iface.disconnected == [COOKIE]
     # Old devices and the old EI context were torn down.
     assert POINTER in fake.unrefed_devices
     assert KEYBOARD in fake.unrefed_devices
@@ -544,7 +546,7 @@ def test_ensure_devices_ready_reconnect_runs_real_negotiation(monkeypatch) -> No
 
     client = _client(stale)
     client._emulating_devices = set()  # stalled: paused, no resume queued
-    client._bus = FakeBus()
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
 
     client._ensure_devices_ready(timeout_s=0.05)
 
@@ -588,7 +590,7 @@ def test_ensure_devices_ready_reconnect_failure_raises_tool_error(monkeypatch) -
 
     client = _client(stale)
     client._emulating_devices = set()
-    client._bus = FakeBus()
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
 
     with pytest.raises(ToolError, match="EIS reconnect failed"):
         client._ensure_devices_ready(timeout_s=0.05)
@@ -832,7 +834,7 @@ def test_reconnect_releases_active_touches(monkeypatch) -> None:
     client = _client(fake)
     client._active_touches = {5: 0x777}
     client._next_touch_id = 6
-    client._eis_iface = FakeIface()
+    client._eis_iface = FakeIface()  # ty: ignore[invalid-assignment]
     client._cookie = COOKIE
     client._setup, _setup_calls = _reconnecting_setup(client, emulating=True)
 
@@ -865,13 +867,15 @@ def test_reconnect_unrefs_old_state(monkeypatch) -> None:
     _install(monkeypatch, fake)
     client = _client(fake)
     client._sequence = 5
-    client._eis_iface = FakeIface()
+    client._eis_iface = FakeIface()  # ty: ignore[invalid-assignment]
     client._cookie = COOKIE
     client._setup, setup_calls = _reconnecting_setup(client, emulating=False)
 
     client._reconnect()
 
-    assert client._eis_iface.disconnected == [COOKIE]
+    iface = client._eis_iface
+    assert iface is not None
+    assert iface.disconnected == [COOKIE]
     assert fake.unrefed_devices.count(POINTER) == 1
     assert fake.unrefed_devices.count(KEYBOARD) == 1
     assert fake.unrefed_ei == [1]
@@ -998,7 +1002,7 @@ def _fresh_setup_client(
     client._held_buttons = set()
     client._connection_dead = False
     client._eis_iface = None
-    client._bus = FakeBus()
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
     return client
 
 
@@ -1142,7 +1146,7 @@ def test_second_ensure_after_failed_reconnect_is_clean_tool_error(monkeypatch) -
 
     client = _client(stale)
     client._emulating_devices = set()
-    client._bus = FakeBus()
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
 
     with pytest.raises(ToolError, match="EIS reconnect failed"):
         client._ensure_devices_ready(timeout_s=0.05)
@@ -1343,11 +1347,11 @@ def test_reconnect_survives_failing_touch_up_and_disconnect(monkeypatch) -> None
     def failing_touch_up(touch: int) -> None:
         raise RuntimeError("EIS connection dead")
 
-    fake.ei_touch_up = failing_touch_up  # type: ignore[method-assign]
+    fake.ei_touch_up = failing_touch_up  # ty: ignore[invalid-assignment]
     client = _client(fake)
     client._active_touches = {0: 0x777}
     client._sequence = 3
-    client._eis_iface = _DisconnectRaisesIface()
+    client._eis_iface = _DisconnectRaisesIface()  # ty: ignore[invalid-assignment]
     client._cookie = COOKIE
     client._setup, setup_calls = _reconnecting_setup(client, emulating=False)
 
@@ -1601,7 +1605,7 @@ def _reconnect_text_path_setup(
 
     client = _client(stale)
     client._text_device = TEXT_DEV  # stale text device, currently paused
-    client._bus = FakeBus()
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
     return client, stale
 
 
@@ -1622,7 +1626,7 @@ def _reconnect_touch_path_setup(
 
     client = _client(stale)
     client._touch_device = TOUCH  # stale touch device, currently paused
-    client._bus = FakeBus()
+    client._bus = FakeBus()  # ty: ignore[invalid-assignment]
     return client, stale
 
 
