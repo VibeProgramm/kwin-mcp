@@ -489,11 +489,12 @@ def _run_script_one_shot(
                 "loadScript",
                 "ss",
                 [script_path, f"{script_name}-{suffix}"],
+                timeout=10.0,
             )
             if int(script_id) < 0:
                 raise RuntimeError("KWin refused to load script (scripting disabled?)")
             bus.get_object("org.kde.KWin", f"/Scripting/Script{int(script_id)}").run(
-                dbus_interface="org.kde.kwin.Script"
+                dbus_interface="org.kde.kwin.Script", timeout=10.0
             )
             deadline = time.monotonic() + timeout
             while "payload" not in received and time.monotonic() < deadline:
@@ -508,6 +509,7 @@ def _run_script_one_shot(
                     "unloadScript",
                     "s",
                     [f"{script_name}-{suffix}"],
+                    timeout=10.0,
                 )
         except Exception:
             pass

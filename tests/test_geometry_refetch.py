@@ -76,6 +76,8 @@ class FakeConn:
         self.removed_sinks: list[Any] = []
         self.load_calls: list[list[str]] = []
         self.unload_calls: list[list[str]] = []
+        self.call_timeouts: list[float] = []
+        self.run_timeouts: list[float] = []
         self.sinks: dict[str, Any] = {}
         self.delivered: set[str] = set()
         self.payload: str = ""
@@ -110,6 +112,7 @@ class FakeConn:
         args: list[str],
         timeout: float = 25.0,
     ) -> int:
+        self.call_timeouts.append(timeout)
         if method == "loadScript":
             self.load_calls.append(list(args))
             return 42
@@ -123,6 +126,7 @@ class FakeConn:
 
         class FakeScript:
             def run(self, dbus_interface: str = "", timeout: float = 25.0) -> None:
+                bus.run_timeouts.append(timeout)
                 # The KWin script calls the sink bus/object path embedded in
                 # the script text, which this fetch exported — deliver to it.
                 for sink_path, sink in bus.sinks.items():
@@ -371,6 +375,25 @@ def test_one_shot_releases_dbus_lifecycle_resources(monkeypatch: Any) -> None:
     assert conn.released == conn.requested, "the per-call name must be released"
     assert len(conn.removed_sinks) == 1, "the sink must be unexported"
     assert conn.closes == 1, "the per-call connection must be closed"
+
+
+def test_one_shot_scripting_calls_carry_explicit_timeouts(monkeypatch: Any) -> None:
+    """Every one-shot D-Bus call is bounded at 10s, not dbus-python's 25s.
+
+    Round-4 BUG-5: the geometry fetch carried explicit 10s bounds but the
+    one-shot load/run/unload still used the 25s defaults, while the
+    changelog claimed 10s across the board — the claim is now true and
+    pinned.
+    """
+    from kwin_mcp.kwin_windows import activate_window_by_name
+
+    conn = FakeConn()
+    _install_fake_dbus(monkeypatch, conn)
+
+    activate_window_by_name("unix:path=/tmp/fake", "kcalc")
+
+    assert conn.call_timeouts == [10.0, 10.0], "loadScript + unloadScript at 10s"
+    assert conn.run_timeouts == [10.0], "the script run itself at 10s"
 
 
 @pytest.mark.parametrize("result", [_OWNER_PRIMARY, _OWNER_ALREADY])
