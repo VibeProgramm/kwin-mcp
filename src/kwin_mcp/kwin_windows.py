@@ -24,6 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,36 @@ def fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
         return []
 
 
+def _close_bus_quietly(bus: Any) -> None:
+    """Close a per-call BusConnection without masking the real result.
+
+    Every scripting helper owns one connection per call; it holds a native
+    file descriptor and, once a sink is exported on it, survives garbage
+    collection — live probes showed an unclosed connection leaking one fd
+    (and one well-known name) per fetch. Cleanup failures are logged, never
+    raised: teardown must not replace the fetch result or exception.
+    """
+    try:
+        if bus.get_is_connected():
+            bus.close()
+    except Exception:
+        logger.debug("D-Bus connection close failed", exc_info=True)
+
+
+def _unique_call_tag() -> str:
+    """A letter-leading, hyphen-free tag, unique per call.
+
+    D-Bus well-known name elements must not start with a digit (a digit may
+    not directly follow '.'), and object path elements may not contain '-'.
+    The earlier ``f"{pid}-{monotonic_ns}"`` suffix violated both rules, so
+    every real geometry fetch died inside name validation and returned `[]`
+    (issue #24). ``p{pid}_{monotonic_ns}`` satisfies both grammars and is
+    unique per call (monotonic nanoseconds are strictly increasing within a
+    process).
+    """
+    return f"p{os.getpid()}_{time.monotonic_ns()}"
+
+
 def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
     import dbus
     import dbus.bus
@@ -172,9 +203,9 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
     # Unique names per call (issue #23): a fixed bus name is held by the
     # first connection, so every later fetch's request_name(DO_NOT_QUEUE)
     # silently fails and the script's Push lands on the zombie loop — 8s
-    # stall, then [] via the blanket guard. Same pid-monotonic_ns suffix
-    # pattern _run_script_one_shot already uses for activate/list.
-    suffix = f"{os.getpid()}-{time.monotonic_ns() % 1_000_000}"
+    # stall, then [] via the blanket guard. The tag shape is valid in both
+    # the bus-name and object-path grammars (_unique_call_tag, issue #24).
+    suffix = _unique_call_tag()
     bus_name = f"org.kwin_mcp.geom.{suffix}"
     object_path = f"/org/kwin_mcp/Geom/{suffix}"
     interface = "org.kwin_mcp.Geom"
@@ -185,6 +216,7 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
     owner = bus.request_name(bus_name, dbus.bus.NAME_FLAG_DO_NOT_QUEUE)
     if owner not in (1, 4):
         logger.warning("geometry fetch: bus name %s unavailable (%s)", bus_name, owner)
+        _close_bus_quietly(bus)
         return []
 
     received: dict[str, str] = {}
@@ -196,7 +228,7 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
             received["payload"] = str(payload)
             loop.quit()
 
-    _Sink(bus, object_path)
+    sink = _Sink(bus, object_path)
     worker = threading.Thread(target=loop.run, daemon=True)
     worker.start()
 
@@ -248,6 +280,20 @@ def _fetch_window_geometries(dbus_address: str) -> list[WindowGeometry]:
             pass
         loop.quit()
         worker.join(timeout=2.0)
+        # Lifecycle cleanup (issue #24): the exported sink anchors the
+        # connection against garbage collection, so an unclosed per-call
+        # connection leaked one fd and one well-known name per fetch.
+        # Release in reverse acquisition order, every step guarded so the
+        # cleanup never masks the real result or exception.
+        try:
+            sink.remove_from_connection()
+        except Exception:
+            logger.debug("geometry fetch: sink unexport failed", exc_info=True)
+        try:
+            bus.release_name(bus_name)
+        except Exception:
+            logger.debug("geometry fetch: name release failed", exc_info=True)
+        _close_bus_quietly(bus)
 
     return _parse_payload(received.get("payload", ""))
 
@@ -392,9 +438,12 @@ def _run_script_one_shot(
     DBusGMainLoop(set_as_default=True)
     bus = dbus.bus.BusConnection(dbus_address)
 
-    suffix = f"{os.getpid()}-{time.monotonic_ns() % 1_000_000}"
-    bus_name = f"org.kwin_mcp.script.{script_name}.pid{suffix}"
-    object_path = "/org/kwin_mcp/ScriptResult"
+    # Same letter-leading, hyphen-free tag as the geometry fetch: the plain
+    # pid-ns suffix would violate the D-Bus name grammar (issue #24), and
+    # the per-call object path keeps concurrent one-shot runs distinct.
+    suffix = _unique_call_tag()
+    bus_name = f"org.kwin_mcp.script.{script_name}.{suffix}"
+    object_path = f"/org/kwin_mcp/ScriptResult/{suffix}"
     interface = "org.kwin_mcp.ScriptResult"
     # Fail fast when the (already unique) name is unavailable instead of
     # stalling for the timeout with the Push going nowhere (issue #24, same
@@ -406,6 +455,7 @@ def _run_script_one_shot(
             f"could not acquire D-Bus name {bus_name} for the KWin script "
             f"result (request_name={owner})"
         )
+        _close_bus_quietly(bus)
         raise RuntimeError(msg)
 
     received: dict[str, str] = {}
@@ -417,7 +467,7 @@ def _run_script_one_shot(
             received["payload"] = str(payload)
             loop.quit()
 
-    _Sink(bus, object_path)
+    sink = _Sink(bus, object_path)
     worker = threading.Thread(target=loop.run, daemon=True)
     worker.start()
 
@@ -463,6 +513,18 @@ def _run_script_one_shot(
             pass
         loop.quit()
         worker.join(timeout=2.0)
+        # Same lifecycle cleanup as the geometry fetch (issue #24): the
+        # exported sink anchors the connection, so every step is guarded
+        # and never masks the result or the caller's exception.
+        try:
+            sink.remove_from_connection()
+        except Exception:
+            logger.debug("one-shot script: sink unexport failed", exc_info=True)
+        try:
+            bus.release_name(bus_name)
+        except Exception:
+            logger.debug("one-shot script: name release failed", exc_info=True)
+        _close_bus_quietly(bus)
 
     return received.get("payload")
 

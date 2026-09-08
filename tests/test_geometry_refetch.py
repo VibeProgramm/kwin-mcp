@@ -196,7 +196,15 @@ def _install_fake_dbus(monkeypatch: Any, conn: FakeConn, payload: str = _PAYLOAD
 
     class FakeServiceObject:
         def __init__(self, conn_: FakeConn, path: str) -> None:
+            self._conn = conn_
+            self._path = path
             conn_.sinks[path] = self
+            conn_.exported.append(path)
+
+        def remove_from_connection(self) -> None:
+            # Mirror dbus.service.Object.remove_from_connection: unexport.
+            self._conn.removed_sinks.append(self)
+            self._conn.sinks.pop(self._path, None)
 
     monkeypatch.setattr(dbus.bus, "BusConnection", lambda _addr: conn, raising=False)
     monkeypatch.setattr(dbus.mainloop.glib, "DBusGMainLoop", lambda **_k: None, raising=False)
@@ -313,6 +321,56 @@ def test_one_shot_generated_names_pass_real_dbus_validation(
     for path in conn.exported:
         _assert_valid_object_path(path)
         assert path.startswith("/org/kwin_mcp/ScriptResult/")
+
+
+def test_fetch_releases_dbus_lifecycle_resources(monkeypatch: Any) -> None:
+    """A completed fetch releases name, sink export and the connection.
+
+    Round-4 BUG-2: the per-call connection was never closed and the
+    exported sink anchored it against garbage collection — live probing
+    showed one leaked fd plus one leftover well-known name per fetch
+    (52 fetches → 53 fds). The fetch path must release everything it
+    acquired, even on the failure paths.
+    """
+    conn = FakeConn()
+    _install_fake_dbus(monkeypatch, conn)
+
+    assert _fetch_window_geometries("unix:path=/tmp/fake") != []
+
+    assert conn.released == conn.requested, "the per-call name must be released"
+    assert len(conn.removed_sinks) == 1, "the sink must be unexported"
+    assert conn.closes == 1, "the per-call connection must be closed"
+
+
+def test_fetch_failure_path_also_releases_lifecycle_resources(monkeypatch: Any) -> None:
+    """Cleanup runs when the payload never arrives (script failure shape).
+
+    The finally-block release must not depend on a successful Push: with no
+    payload delivered the fetch still unexports the sink, releases the name
+    and closes the connection, and returns [] through the outer guard.
+    """
+    conn = FakeConn()
+    _install_fake_dbus(monkeypatch, conn, payload="")
+    monkeypatch.setattr(kw, "FETCH_TIMEOUT_S", 0.05)
+
+    assert _fetch_window_geometries("unix:path=/tmp/fake") == []
+    assert conn.released == conn.requested
+    assert len(conn.removed_sinks) == 1
+    assert conn.closes == 1
+
+
+def test_one_shot_releases_dbus_lifecycle_resources(monkeypatch: Any) -> None:
+    """The one-shot scripting path shares the leak shape — and the fix."""
+    from kwin_mcp.kwin_windows import activate_window_by_name
+
+    conn = FakeConn()
+    _install_fake_dbus(monkeypatch, conn)
+
+    activate_window_by_name("unix:path=/tmp/fake", "kcalc")
+
+    assert conn.released == conn.requested, "the per-call name must be released"
+    assert len(conn.removed_sinks) == 1, "the sink must be unexported"
+    assert conn.closes == 1, "the per-call connection must be closed"
 
 
 @pytest.mark.parametrize("result", [_OWNER_PRIMARY, _OWNER_ALREADY])
