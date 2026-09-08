@@ -185,7 +185,7 @@ kwin-mcp-cli --default-live-session
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `session_start` | `app_command?` `str`, `screen_width?` `int` (1920), `screen_height?` `int` (1080), `enable_clipboard?` `bool` (false), `keep_screenshots?` `bool` (false), `isolate_home?` `bool` (false), `keep_home?` `bool` (false), `env?` `dict` | Start an isolated KWin Wayland session, optionally launching an app. Set `enable_clipboard=true` to enable clipboard tools (requires `wl-clipboard`). Set `keep_screenshots=true` to preserve screenshot files after `session_stop`. Set `isolate_home=true` to create a temporary HOME with isolated XDG directories (config, data, cache, state), preventing apps from reading/writing host user settings. Set `keep_home=true` to preserve the isolated home directory after `session_stop`. Pass extra environment variables via `env`. |
+| `session_start` | `app_command?` `str`, `screen_width?` `int` (0 = auto-detect), `screen_height?` `int` (0 = auto-detect), `enable_clipboard?` `bool` (false), `keep_screenshots?` `bool` (false), `isolate_home?` `bool` (false), `keep_home?` `bool` (false), `env?` `dict` | Start an isolated KWin Wayland session, optionally launching an app. A screen size of `0` auto-detects the bounding box of the logical desktop (all enabled outputs / connected monitors). Set `enable_clipboard=true` to enable clipboard tools (requires `wl-clipboard`). Set `keep_screenshots=true` to preserve screenshot files after `session_stop`. Set `isolate_home=true` to create a temporary HOME with isolated XDG directories (config, data, cache, state), preventing apps from reading/writing host user settings. Set `keep_home=true` to preserve the isolated home directory after `session_stop`. Pass extra environment variables via `env`. |
 | `session_connect` | `dbus_address?` `str`, `wayland_display?` `str`, `keep_screenshots?` `bool` (false) | Connect to an existing KWin session (real desktop or container). Defaults to `$DBUS_SESSION_BUS_ADDRESS` and `$WAYLAND_DISPLAY`. Clipboard is always enabled. `session_stop` only disconnects without killing KWin or pre-existing apps. |
 | `session_stop` | _(none)_ | Stop the session and clean up. For virtual sessions: terminates KWin and all apps. For live sessions: disconnects without killing KWin or pre-existing apps. |
 
@@ -431,6 +431,41 @@ uv run kwin-mcp
 - **QMenu (native context menus) may not appear in AT-SPI2** -- Qt's AT-SPI2 bridge has incomplete support for popup menus on Wayland. Context menus may not be visible in `accessibility_tree` or `find_ui_elements`. Workaround: use `screenshot` to visually locate menu items and click by coordinates.
 - **Screen edge triggers do not work with EIS input** -- Auto-hide panels and layer-shell trigger strips rely on Wayland surface input routing, which may not respond to EIS-injected pointer events. Workaround: use `dbus_call` with KWin scripting or keyboard shortcuts instead.
 - **AT-SPI2 coordinate translation is best-effort** -- Wayland clients report window-local coordinates (they do not know their global screen position by design). kwin-mcp translates them to true screen coordinates using each window's compositor-side geometry (queried from KWin scripting, matched by caption). If a window cannot be matched, its coordinates fall back to window-local -- cross-reference with `screenshot` to disambiguate.
+
+## Troubleshooting & Debugging
+
+### Verbose libei/EIS diagnostics (`KWIN_MCP_DEBUG_EI=1`)
+
+Set the environment variable `KWIN_MCP_DEBUG_EI=1` to enable verbose
+diagnostics for the EIS input injection path (kwin-mcp's direct libei
+connection to KWin):
+
+```bash
+KWIN_MCP_DEBUG_EI=1 uv run kwin-mcp
+```
+
+When enabled, the `kwin_mcp.input` logger is raised to `DEBUG` level with a
+stderr handler and logs EIS device lifecycle events
+(ADDED / REMOVED / RESUMED / PAUSED / SEAT_REMOVED), device stalls, and
+connection rebuilds. Use it when input injection silently does nothing or
+behaves erratically: the log shows whether KWin is pausing/removing its EIS
+devices around input bursts and whether kwin-mcp manages to rebuild the
+connection.
+
+```bash
+KWIN_MCP_DEBUG_EI=1 uv run kwin-mcp 2>eis-debug.log
+```
+
+### Other symptoms
+
+- **No input backend available** in `session_start` output — KWin did not
+  expose its EIS RemoteDesktop interface; the session degrades to a
+  screenshot/AT-SPI2-only session (no injection). Check the KWin version
+  (Plasma 6 required) and the server log for the degradation reason.
+- **`keyboard_type_unicode` fails in virtual sessions** — `kwin_wayland
+  --virtual` does not expose the virtual-keyboard protocol `wtype` needs;
+  the clipboard fallback (requires `wl-clipboard`) is the primary path
+  there.
 
 ## Contributing
 

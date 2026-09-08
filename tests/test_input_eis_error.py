@@ -56,8 +56,9 @@ def test_setup_translates_connect_failure_from_interface_proxy(
         def __init__(self, *args: Any) -> None:
             pass
 
-        # Mirrors the real D-Bus method name (camelCase per the KWin interface).
-        def connectToEIS(self, *args: Any) -> None:  # noqa: N802
+        # Mirrors the real D-Bus method name (camelCase per the KWin
+        # interface); **kwargs absorbs the explicit timeout kwarg (issue #24).
+        def connectToEIS(self, *args: Any, **kwargs: Any) -> None:  # noqa: N802
             raise dbus.DBusException("org.kde.KWin.EIS.RemoteDesktop: not supported")
 
     monkeypatch.setattr(input_module.dbus, "Interface", _ThrowingIface)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,196 @@ from kwin_mcp.screenshot import capture_frame_burst, capture_screenshot_to_file
 from kwin_mcp.session import LiveSession, Session, SessionConfig
 
 logger = logging.getLogger(__name__)
+
+# Frame file names produced by the burst capture (screenshot.py, both the
+# ScreenShot2 and the spectacle path): "frame_{i:03d}_{delay_ms}ms.png" —
+# the frame's position in the sorted delay list plus its TRUE capture
+# delay. Used by _with_frame_capture to label frames: the capture layer
+# skips empty frames inside its internals, so list position alone cannot
+# recover the delay.
+_FRAME_NAME_RE = re.compile(r"frame_\d{3}_(\d+)ms\.png$")
+
+_DEFAULT_VIRTUAL_SIZE = (1920, 1080)
+
+# kscreen-doctor colourises its output with SGR escape sequences even when
+# piped (capture_output), e.g. '\x1b[01;33m\tGeometry: \x1b[0;0m0,0 1746x982' —
+# every line must be stripped before any startswith() check (A1).
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(line: str) -> str:
+    """Strip ANSI escape sequences from one output line."""
+    return _ANSI_ESCAPE_RE.sub("", line)
+
+
+def _parse_kscreen_doctor(output: str) -> tuple[int, int] | None:
+    """Return the bounding box of all enabled outputs from ``kscreen-doctor -o``.
+
+    The output is a list of per-output blocks starting with an "Output:" line
+    and containing flag lines ("enabled"/"disabled", "priority N") plus a
+    "Geometry: x,y WxH" line. Only enabled outputs are considered — a
+    disabled output may still print a (stale) Geometry line. The desktop
+    size is the axis-aligned bounding box (union) of every enabled output's
+    geometry: ``min(x,y) .. max(x+w, y+h)`` — the logical desktop, not a
+    single monitor (F3). Mirrored outputs with identical geometry naturally
+    collapse into the same rectangle. Sizes are the visible (logical, already
+    scaled by the compositor) desktop dimensions.
+
+    Some kscreen-doctor versions compact the flags and the geometry onto the
+    "Output:" line itself, so the Geometry match is searched per line
+    instead of requiring a line that starts with "Geometry:".
+    """
+    boxes: list[tuple[int, int, int, int]] = []  # (x, y, w, h) per enabled output
+    enabled = False
+    geometry: tuple[int, int, int, int] | None = None
+
+    def finish_block() -> None:
+        if enabled and geometry is not None:
+            boxes.append(geometry)
+
+    def parse_geometry(line: str) -> tuple[int, int, int, int] | None:
+        """Extract the ``x,y WxH`` geometry from any line holding one."""
+        match = re.search(r"(-?\d+),\s*(-?\d+)\s+(\d+)x(\d+)", line)
+        if match:
+            return (
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4)),
+            )
+        return None
+
+    for raw_line in output.splitlines():
+        line = _strip_ansi(raw_line).strip()
+        if line.startswith("Output:"):
+            finish_block()
+            enabled = False
+            geometry = None
+            # Some kscreen-doctor versions put the flags on the "Output:"
+            # line itself ("Output: 1 eDP-1 enabled connected priority 1");
+            # others print them as indented follow-up lines, either one flag
+            # per line or combined ("enabled connected priority 1").
+            rest = line[len("Output:") :]
+            tokens = rest.split()
+            if "enabled" in tokens:
+                enabled = True
+            elif "disabled" in tokens:
+                enabled = False
+            # The same compact form may also carry the Geometry on this
+            # line ("... priority 1 Geometry: 0,0 1920x1080"), so every
+            # line is searched for a geometry, not just Geometry:-led ones.
+            # A Geometry marker without parseable numbers leaves any earlier
+            # geometry of the block untouched, as before.
+            if "Geometry:" in rest:
+                parsed = parse_geometry(rest)
+                if parsed is not None:
+                    geometry = parsed
+        elif "Geometry:" in line:
+            parsed = parse_geometry(line)
+            if parsed is not None:
+                geometry = parsed
+        else:
+            # Generic flag line: may hold a bare flag ("enabled"), a combined
+            # set ("enabled connected priority 1"), or just a priority.
+            tokens = line.split()
+            if "enabled" in tokens:
+                enabled = True
+            elif "disabled" in tokens:
+                enabled = False
+    finish_block()
+    if not boxes:
+        return None
+    x0 = min(box[0] for box in boxes)
+    y0 = min(box[1] for box in boxes)
+    x1 = max(box[0] + box[2] for box in boxes)
+    y1 = max(box[1] + box[3] for box in boxes)
+    return (x1 - x0, y1 - y0)
+
+
+def _signed_offset(token: str) -> int:
+    """Parse an xrandr offset token like ``+0``, ``-1920`` or ``+-1920``.
+
+    xrandr prints negative offsets with a doubled sign (``1920x1080+-1920+0``
+    for a monitor left of the origin); ``int()`` would raise ValueError on
+    the doubled form.
+    """
+    return int(token[1:]) if token[0] == "+" and token[1:2] == "-" else int(token)
+
+
+def _parse_xrandr(output: str) -> tuple[int, int] | None:
+    """Return the desktop size from ``xrandr`` output.
+
+    The desktop size is the axis-aligned bounding box (union) of all
+    connected monitors' geometries (``WxH+X+Y``); disconnected monitors
+    contribute nothing — that union IS the logical desktop (F3). The
+    "Screen 0: ... current W x H" line (the whole framebuffer) is only a
+    fallback for outputs without usable monitor lines.
+    """
+    boxes: list[tuple[int, int, int, int]] = []  # (w, h, x, y) per connected monitor
+    current: tuple[int, int] | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if current is None and line.startswith("Screen ") and "current " in line:
+            # xrandr renders the current size with spaces around 'x'.
+            match = re.search(r"current\s+(\d+)\s*x\s*(\d+)", line)
+            if match:
+                current = (int(match.group(1)), int(match.group(2)))
+        if re.search(r"\bconnected\b", line) and not re.search(r"\bdisconnected\b", line):
+            match = re.search(r"\b(\d+)x(\d+)\s*([+-]-?\d+)\s*([+-]-?\d+)\b", line)
+            if match:
+                boxes.append(
+                    (
+                        int(match.group(1)),
+                        int(match.group(2)),
+                        _signed_offset(match.group(3)),
+                        _signed_offset(match.group(4)),
+                    )
+                )
+    if boxes:
+        x0 = min(box[2] for box in boxes)
+        y0 = min(box[3] for box in boxes)
+        x1 = max(box[2] + box[0] for box in boxes)
+        y1 = max(box[3] + box[1] for box in boxes)
+        return (x1 - x0, y1 - y0)
+    return current
+
+
+def _detect_physical_screen_size() -> tuple[int, int]:
+    """Detect the visible desktop resolution of the current session.
+
+    Uses kscreen-doctor (KDE) first, falling back to xrandr for X11 sessions.
+    Returns the (width, height) of the bounding box of the logical desktop —
+    the union of enabled outputs' (kscreen-doctor) or connected monitors'
+    (xrandr) geometries, i.e. the visible (logical) desktop size as the
+    compositor scales it, not a single panel's pixel size — or the default
+    size when detection fails. Called at every session_start so a changed
+    desktop size is picked up by the next virtual session (adopted from
+    01SW/kwin-mcp).
+    """
+    # kscreen-doctor: Geometry lines of enabled outputs, e.g. "Geometry: 0,0 1920x1080"
+    if shutil.which("kscreen-doctor"):
+        try:
+            result = subprocess.run(
+                ["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=5
+            )
+            size = _parse_kscreen_doctor(result.stdout)
+            if size is not None:
+                return size
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+    # xrandr: connected monitors, e.g. "DP-2 connected primary 1920x1080+0+0"
+    if shutil.which("xrandr"):
+        try:
+            result = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=5)
+            size = _parse_xrandr(result.stdout)
+            if size is not None:
+                return size
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+    return _DEFAULT_VIRTUAL_SIZE
+
 
 # Install hints for external binaries
 _INSTALL_HINTS: dict[str, str] = {
@@ -199,9 +390,21 @@ class AutomationEngine:
         )
 
         lines = [action_result, f"Captured {len(frames)} frames:"]
-        for delay_ms, path in zip(sorted(screenshot_after_ms), frames, strict=True):
+        # The capture layer (screenshot.py) skips empty (failed) frames
+        # inside its own internals — core.py never sees which delay was
+        # dropped — so pairing the requested delays against the returned
+        # paths positionally mislabels every frame after an interior
+        # empty one (delays [0, 100, 200] with an empty 100ms frame
+        # reported the 200ms file as "100ms"). The capture layer instead
+        # encodes the true per-frame delay in the file name
+        # (frame_{i:03d}_{delay_ms}ms.png), so the label is read from the
+        # name; anything off-convention degrades to an honest "?" rather
+        # than a plausible false timing.
+        for path in frames:
             size_kb = path.stat().st_size / 1024
-            lines.append(f"  {delay_ms}ms: {path} ({size_kb:.1f} KB)")
+            match = _FRAME_NAME_RE.search(path.name)
+            delay_label = f"{match.group(1)}ms" if match else "?ms"
+            lines.append(f"  {delay_label}: {path} ({size_kb:.1f} KB)")
         return "\n".join(lines)
 
     # ── Session management ────────────────────────────────────────────────
@@ -209,8 +412,8 @@ class AutomationEngine:
     def session_start(
         self,
         app_command: str = "",
-        screen_width: int = 1920,
-        screen_height: int = 1080,
+        screen_width: int = 0,
+        screen_height: int = 0,
         enable_clipboard: bool = False,
         keep_screenshots: bool = False,
         isolate_home: bool = False,
@@ -220,6 +423,21 @@ class AutomationEngine:
         """Start an isolated KWin Wayland session, optionally launching an app."""
         if self._session is not None and self._session.is_running:
             tool_error("Session already running. Call session_stop first.")
+
+        if screen_width < 0:
+            tool_error(f"Invalid screen_width {screen_width}: must be >= 0 (0 = auto-detect)")
+        if screen_height < 0:
+            tool_error(f"Invalid screen_height {screen_height}: must be >= 0 (0 = auto-detect)")
+
+        # Auto-detect the visible desktop size when not explicitly requested.
+        # 0 in either dimension means "match the current desktop": both
+        # dimensions are resolved together from detection, so a partially
+        # zero request (e.g. 0x720) does not mix a detected width with a
+        # caller height into a nonsensical aspect ratio. Detection runs at
+        # every call so a changed desktop size is applied to the next
+        # virtual session (adopted from 01SW/kwin-mcp).
+        if screen_width == 0 or screen_height == 0:
+            screen_width, screen_height = _detect_physical_screen_size()
 
         self._clipboard_enabled = enable_clipboard
         self._screen_size = (screen_width, screen_height)
@@ -249,7 +467,14 @@ class AutomationEngine:
         time.sleep(0.5)
         try:
             self._input = InputBackend(info.dbus_address)
-        except RuntimeError as exc:
+        except (RuntimeError, ToolError) as exc:
+            # ToolError, not just RuntimeError (F5): a partial EIS handshake
+            # (device never resumed) surfaces as ToolError from
+            # _negotiate_devices, and ToolError does not inherit RuntimeError
+            # — catching only RuntimeError killed session_start after the
+            # session was already up, breaking the degrade-to-no-input
+            # contract (screenshot/accessibility tools still work without
+            # input).
             logger.warning(
                 "KWin EIS input backend unavailable, degrading to no input backend: %s", exc
             )
@@ -312,7 +537,11 @@ class AutomationEngine:
         try:
             self._input = InputBackend(dbus_addr)
             result += "\nInput backend: KWin EIS"
-        except RuntimeError as exc:
+        except (RuntimeError, ToolError) as exc:
+            # ToolError, not just RuntimeError (F5): a partial EIS handshake
+            # raises ToolError from _negotiate_devices; without it in the
+            # tuple the failure escaped session_connect instead of degrading
+            # to the ydotool/no-input fallback.
             logger.warning(
                 "KWin EIS input backend unavailable, falling back to ydotool if present: %s", exc
             )
@@ -785,8 +1014,11 @@ class AutomationEngine:
         if info and info.dbus_address:
             try:
                 return kwin_windows.list_windows_by_script(info.dbus_address)
-            except (RuntimeError, dbus.DBusException):
-                pass
+            except (RuntimeError, dbus.DBusException) as exc:
+                # Swallowed on purpose (AT-SPI fallback below), but not
+                # silently: the failure reason is needed to diagnose a
+                # session where every window listing comes from AT-SPI only.
+                logger.debug("KWin scripting window list failed: %s", exc)
         self._get_session()
         resp = self._run_atspi("list_windows")
         return resp["result"]

@@ -9,6 +9,7 @@ from virtual (isolated) to live (real desktop).
 
 from __future__ import annotations
 
+import importlib.metadata
 import sys
 from typing import Annotated
 
@@ -17,7 +18,22 @@ from pydantic import Field
 
 from kwin_mcp.core import AutomationEngine
 
-mcp = MCPServer("kwin-mcp")
+
+def _server_version() -> str:
+    """Package version for the MCP ``serverInfo`` (empty default otherwise).
+
+    The MCP SDK defaults ``version`` to an empty string; report the real
+    installed version so clients can display/track it. Falls back to
+    "unknown" when the package metadata is unavailable (e.g. running from a
+    bare source tree without installation).
+    """
+    try:
+        return importlib.metadata.version("kwin-mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+mcp = MCPServer("kwin-mcp", version=_server_version())
 _engine = AutomationEngine()
 
 # Detect --default-live-session flag early (before MCP framework consumes args)
@@ -36,8 +52,22 @@ async def session_start(
             "Leave empty to start session without an app."
         ),
     ] = "",
-    screen_width: Annotated[int, Field(description="Virtual screen width in pixels.")] = 1920,
-    screen_height: Annotated[int, Field(description="Virtual screen height in pixels.")] = 1080,
+    screen_width: Annotated[
+        int,
+        Field(
+            description="Virtual screen width in pixels. 0 or omitted = auto-detect "
+            "the visible (logical) desktop size (measured at session start). "
+            "0 in either dimension auto-detects both dimensions."
+        ),
+    ] = 0,
+    screen_height: Annotated[
+        int,
+        Field(
+            description="Virtual screen height in pixels. 0 or omitted = auto-detect "
+            "the visible (logical) desktop size (measured at session start). "
+            "0 in either dimension auto-detects both dimensions."
+        ),
+    ] = 0,
     enable_clipboard: Annotated[
         bool,
         Field(
